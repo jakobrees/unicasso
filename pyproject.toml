@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unicasso"
+version = "0.1.0"
+description = "Image-to-ASCII art by direct optimization: CLIP-driven search over a glyph-VAE latent space, any monospace font, optional color."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "Jakob Rees" }]
+keywords = ["ascii-art", "clip", "generative-art", "text-art", "optimization"]
+dependencies = [
+    "torch>=2.1",
+    "numpy",
+    "pillow>=10.0",   # fractional font sizes (kit calibration solves for exact cell advance)
+    "tqdm",
+    "open_clip_torch",
+    "timm",
+    "matplotlib",
+    "fonttools",
+    "scipy",
+    "scikit-learn",
+]
+
+[project.scripts]
+unicasso = "unicasso.engine.asciify:main"
+
+[project.urls]
+Repository = "https://github.com/jakobrees/unicasso"
+
+[project.optional-dependencies]
+lineart = ["diffusers", "transformers", "accelerate", "jinja2>=3.1"]   # local FLUX lineart front-end (jinja2: Qwen3 chat template; distro copies are older)
+qr = ["segno"]                                          # QR artcode output (pure Python, no compiled deps)
+
+[tool.setuptools.packages.find]
+include = ["unicasso*"]
+
+[tool.setuptools.package-data]
+"unicasso.lineart" = ["prompts/*.txt"]
+"unicasso.artcode" = ["tables/*.bin"]

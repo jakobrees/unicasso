@@ -1,0 +1,5 @@
+Convert the subject of this image into clean, minimal black-and-white line art. Use only smooth, continuous outlines of uniform thickness, solid black on a pure white background — no shading, no gradients, no gray, no hatching, no cross-hatching, no stippling, no texture.
+
+Draw only the most important contours: the main silhouette and a few defining interior edges. Omit fine detail, surface texture, patterns, fabric folds, individual hairs, fur, foliage, and busy backgrounds. Collapse any textured or detailed/transparent region into a single clean outline, or leave it empty white space.
+
+Keep line density LOW and EVEN across the entire image — no area should become dense or cluttered. Large parts of the image should be empty. Style: a simple children's coloring-book outline — bold, clean, highly simplified, very few lines.

@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "UNICASSO: image to ASCII art by direct optimization"
+type: software
+authors:
+  - family-names: Rees
+    given-names: Jakob Moritz
+repository-code: "https://github.com/jakobrees/unicasso"
+license: MIT
+version: 0.1.0
+date-released: 2026-08-10
+keywords:
+  - ascii-art
+  - image-to-ascii
+  - perceptual-optimization
+  - clip

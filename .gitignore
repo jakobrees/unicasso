@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+venv/
+.venv/
+runs/
+out/
+data/
+*.egg-info/
+
+# Apple SF Mono may live here locally for the sfmono kit; never commit it.
+kits/sfmono/fonts/

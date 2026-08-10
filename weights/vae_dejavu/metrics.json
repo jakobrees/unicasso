@@ -1,0 +1,9 @@
+{
+  "rank_agreement_latent": 0.4055799578939707,
+  "rank_agreement_pixel": 0.8717357824648816,
+  "nn1_oracle_cost_latent": 1.5836302042007446,
+  "nn1_oracle_cost_pixel": 1.4266194105148315,
+  "invariance_acc": 0.9943820224719101,
+  "final_loss": 0.11364584416151047,
+  "recon_full_mse": 0.002358286874368787
+}

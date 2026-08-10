@@ -1,0 +1,1993 @@
+{
+  "categories": [
+    "vert",
+    "horiz",
+    "diag",
+    "curve",
+    "box",
+    "corner",
+    "dot",
+    "dense",
+    "letter",
+    "sparse"
+  ],
+  "glyphs": {
+    " ": {
+      "quality": 0.85,
+      "manual": true,
+      "categories": []
+    },
+    "!": {
+      "quality": 0.8245,
+      "manual": false,
+      "categories": [
+        "box"
+      ]
+    },
+    "\"": {
+      "quality": 0.5393,
+      "manual": true,
+      "categories": []
+    },
+    "#": {
+      "quality": 0.5528,
+      "manual": true,
+      "categories": []
+    },
+    "$": {
+      "quality": 0.4033,
+      "manual": true,
+      "categories": []
+    },
+    "%": {
+      "quality": 0.3625,
+      "manual": true,
+      "categories": []
+    },
+    "&": {
+      "quality": 0.4019,
+      "manual": true,
+      "categories": []
+    },
+    "'": {
+      "quality": 0.7762,
+      "manual": false,
+      "categories": []
+    },
+    "(": {
+      "quality": 0.8447,
+      "manual": false,
+      "categories": [
+        "box"
+      ]
+    },
+    ")": {
+      "quality": 0.8448,
+      "manual": false,
+      "categories": [
+        "box"
+      ]
+    },
+    "*": {
+      "quality": 0.6885,
+      "manual": true,
+      "categories": []
+    },
+    "+": {
+      "quality": 0.5886,
+      "manual": true,
+      "categories": []
+    },
+    ",": {
+      "quality": 0.7796,
+      "manual": false,
+      "categories": []
+    },
+    "-": {
+      "quality": 0.9198,
+      "manual": false,
+      "categories": [
+        "box",
+        "sparse"
+      ]
+    },
+    ".": {
+      "quality": 0.1551,
+      "manual": true,
+      "categories": []
+    },
+    "/": {
+      "quality": 0.9526,
+      "manual": false,
+      "categories": [
+        "box"
+      ]
+    },
+    "1": {
+      "quality": 0.3905,
+      "manual": false,
+      "categories": [
+        "box"
+      ]
+    },
+    "6": {
+      "quality": 0.2793,
+      "manual": false,
+      "categories": []
+    },
+    "7": {
+      "quality": 0.556,
+      "manual": false,
+      "categories": []
+    },
+    "8": {
+      "quality": 0.144,
+      "manual": false,
+      "categories": []
+    },
+    "9": {
+      "quality": 0.2861,
+      "manual": false,
+      "categories": []
+    },
+    ":": {
+      "quality": 0.2725,
+      "manual": false,
+      "categories": []
+    },
+    ";": {
+      "quality": 0.7212,
+      "manual": false,
+      "categories": []
+    },
+    "<": {
+      "quality": 0.6526,
+      "manual": true,
+      "categories": []
+    },
+    "=": {
+      "quality": 0.6743,
+      "manual": true,
+      "categories": []
+    },
+    ">": {
+      "quality": 0.6496,
+      "manual": true,
+      "categories": []
+    },
+    "?": {
+      "quality": 0.4746,
+      "manual": false,
+      "categories": []
+    },
+    "@": {
+      "quality": 0.3403,
+      "manual": false,
+      "categories": []
+    },
+    "A": {
+      "quality": 0.355,
+      "manual": false,
+      "categories": []
+    },
+    "B": {
+      "quality": 0.2143,
+      "manual": false,
+      "categories": []
+    },
+    "C": {
+      "quality": 0.258,
+      "manual": false,
+      "categories": []
+    },
+    "D": {
+      "quality": 0.5705,
+      "manual": true,
+      "categories": []
+    },
+    "E": {
+      "quality": 0.3609,
+      "manual": true,
+      "categories": []
+    },
+    "F": {
+      "quality": 0.3288,
+      "manual": true,
+      "categories": []
+    },
+    "G": {
+      "quality": 0.3651,
+      "manual": true,
+      "categories": []
+    },
+    "H": {
+      "quality": 0.3044,
+      "manual": true,
+      "categories": []
+    },
+    "I": {
+      "quality": 0.3224,
+      "manual": false,
+      "categories": []
+    },
+    "J": {
+      "quality": 0.5972,
+      "manual": true,
+      "categories": []
+    },
+    "K": {
+      "quality": 0.3058,
+      "manual": true,
+      "categories": []
+    },
+    "L": {
+      "quality": 0.6776,
+      "manual": true,
+      "categories": [
+        "box"
+      ]
+    },
+    "O": {
+      "quality": 0.6742,
+      "manual": true,
+      "categories": []
+    },
+    "P": {
+      "quality": 0.4195,
+      "manual": true,
+      "categories": []
+    },
+    "Q": {
+      "quality": 0.7076,
+      "manual": true,
+      "categories": []
+    },
+    "R": {
+      "quality": 0.3887,
+      "manual": true,
+      "categories": []
+    },
+    "S": {
+      "quality": 0.4055,
+      "manual": false,
+      "categories": []
+    },
+    "T": {
+      "quality": 0.4716,
+      "manual": false,
+      "categories": []
+    },
+    "U": {
+      "quality": 0.5972,
+      "manual": true,
+      "categories": []
+    },
+    "V": {
+      "quality": 0.6637,
+      "manual": true,
+      "categories": []
+    },
+    "X": {
+      "quality": 0.6746,
+      "manual": true,
+      "categories": []
+    },
+    "Y": {
+      "quality": 0.5707,
+      "manual": true,
+      "categories": []
+    },
+    "Z": {
+      "quality": 0.4924,
+      "manual": true,
+      "categories": []
+    },
+    "[": {
+      "quality": 0.659,
+      "manual": false,
+      "categories": [
+        "box"
+      ]
+    },
+    "\\": {
+      "quality": 0.9524,
+      "manual": false,
+      "categories": [
+        "box",
+        "letter"
+      ]
+    },
+    "]": {
+      "quality": 0.6711,
+      "manual": false,
+      "categories": [
+        "box"
+      ]
+    },
+    "^": {
+      "quality": 0.6408,
+      "manual": true,
+      "categories": []
+    },
+    "_": {
+      "quality": 0.9068,
+      "manual": false,
+      "categories": [
+        "box",
+        "sparse"
+      ]
+    },
+    "a": {
+      "quality": 0.2002,
+      "manual": false,
+      "categories": []
+    },
+    "b": {
+      "quality": 0.3385,
+      "manual": false,
+      "categories": []
+    },
+    "c": {
+      "quality": 0.1314,
+      "manual": false,
+      "categories": []
+    },
+    "d": {
+      "quality": 0.3908,
+      "manual": true,
+      "categories": []
+    },
+    "e": {
+      "quality": 0.1884,
+      "manual": false,
+      "categories": []
+    },
+    "f": {
+      "quality": 0.4217,
+      "manual": false,
+      "categories": []
+    },
+    "g": {
+      "quality": 0.2864,
+      "manual": false,
+      "categories": []
+    },
+    "h": {
+      "quality": 0.447,
+      "manual": true,
+      "categories": []
+    },
+    "k": {
+      "quality": 0.4018,
+      "manual": true,
+      "categories": []
+    },
+    "l": {
+      "quality": 0.3548,
+      "manual": false,
+      "categories": [
+        "box",
+        "letter"
+      ]
+    },
+    "m": {
+      "quality": 0.1364,
+      "manual": false,
+      "categories": []
+    },
+    "n": {
+      "quality": 0.2191,
+      "manual": true,
+      "categories": []
+    },
+    "o": {
+      "quality": 0.5797,
+      "manual": true,
+      "categories": []
+    },
+    "p": {
+      "quality": 0.2476,
+      "manual": true,
+      "categories": []
+    },
+    "q": {
+      "quality": 0.2475,
+      "manual": true,
+      "categories": []
+    },
+    "r": {
+      "quality": 0.3464,
+      "manual": false,
+      "categories": []
+    },
+    "s": {
+      "quality": 0.3726,
+      "manual": false,
+      "categories": []
+    },
+    "t": {
+      "quality": 0.3983,
+      "manual": false,
+      "categories": []
+    },
+    "u": {
+      "quality": 0.0863,
+      "manual": false,
+      "categories": []
+    },
+    "v": {
+      "quality": 0.65,
+      "manual": true,
+      "categories": []
+    },
+    "w": {
+      "quality": 0.1312,
+      "manual": false,
+      "categories": []
+    },
+    "x": {
+      "quality": 0.5695,
+      "manual": true,
+      "categories": []
+    },
+    "z": {
+      "quality": 0.5579,
+      "manual": true,
+      "categories": []
+    },
+    "{": {
+      "quality": 0.5754,
+      "manual": false,
+      "categories": [
+        "box"
+      ]
+    },
+    "|": {
+      "quality": 0.9654,
+      "manual": false,
+      "categories": [
+        "box"
+      ]
+    },
+    "}": {
+      "quality": 0.5756,
+      "manual": false,
+      "categories": [
+        "box"
+      ]
+    },
+    "~": {
+      "quality": 0.577,
+      "manual": false,
+      "categories": [
+        "box"
+      ]
+    },
+    "¡": {
+      "quality": 0.8128,
+      "manual": false,
+      "categories": []
+    },
+    "¢": {
+      "quality": 0.2478,
+      "manual": true,
+      "categories": []
+    },
+    "¦": {
+      "quality": 0.9234,
+      "manual": false,
+      "categories": []
+    },
+    "§": {
+      "quality": 0.3157,
+      "manual": true,
+      "categories": []
+    },
+    "ª": {
+      "quality": 0.6312,
+      "manual": true,
+      "categories": []
+    },
+    "«": {
+      "quality": 0.65,
+      "manual": true,
+      "categories": [
+        "dot"
+      ]
+    },
+    "¬": {
+      "quality": 0.6727,
+      "manual": false,
+      "categories": [
+        "box"
+      ]
+    },
+    "¯": {
+      "quality": 0.827,
+      "manual": false,
+      "categories": [
+        "sparse"
+      ]
+    },
+    "°": {
+      "quality": 0.5583,
+      "manual": true,
+      "categories": []
+    },
+    "±": {
+      "quality": 0.5685,
+      "manual": true,
+      "categories": [
+        "vert"
+      ]
+    },
+    "²": {
+      "quality": 0.4695,
+      "manual": false,
+      "categories": []
+    },
+    "³": {
+      "quality": 0.3178,
+      "manual": false,
+      "categories": []
+    },
+    "¶": {
+      "quality": 0.5571,
+      "manual": false,
+      "categories": []
+    },
+    "·": {
+      "quality": 0.6632,
+      "manual": true,
+      "categories": []
+    },
+    "¹": {
+      "quality": 0.3552,
+      "manual": false,
+      "categories": []
+    },
+    "º": {
+      "quality": 0.6059,
+      "manual": true,
+      "categories": []
+    },
+    "»": {
+      "quality": 0.632,
+      "manual": true,
+      "categories": [
+        "dot"
+      ]
+    },
+    "¿": {
+      "quality": 0.582,
+      "manual": true,
+      "categories": []
+    },
+    "×": {
+      "quality": 0.75,
+      "manual": true,
+      "categories": []
+    },
+    "Ø": {
+      "quality": 0.3216,
+      "manual": false,
+      "categories": []
+    },
+    "ß": {
+      "quality": 0.4824,
+      "manual": true,
+      "categories": []
+    },
+    "÷": {
+      "quality": 0.7719,
+      "manual": true,
+      "categories": [
+        "vert"
+      ]
+    },
+    "ø": {
+      "quality": 0.4624,
+      "manual": true,
+      "categories": []
+    },
+    "þ": {
+      "quality": 0.365,
+      "manual": false,
+      "categories": []
+    },
+    "Γ": {
+      "quality": 0.7642,
+      "manual": true,
+      "categories": []
+    },
+    "Δ": {
+      "quality": 0.7115,
+      "manual": true,
+      "categories": []
+    },
+    "Θ": {
+      "quality": 0.1938,
+      "manual": false,
+      "categories": []
+    },
+    "Λ": {
+      "quality": 0.5873,
+      "manual": true,
+      "categories": []
+    },
+    "Ξ": {
+      "quality": 0.6619,
+      "manual": false,
+      "categories": []
+    },
+    "Π": {
+      "quality": 0.6269,
+      "manual": true,
+      "categories": []
+    },
+    "Φ": {
+      "quality": 0.6077,
+      "manual": true,
+      "categories": []
+    },
+    "Ψ": {
+      "quality": 0.4744,
+      "manual": true,
+      "categories": []
+    },
+    "Ω": {
+      "quality": 0.4956,
+      "manual": true,
+      "categories": []
+    },
+    "α": {
+      "quality": 0.1484,
+      "manual": false,
+      "categories": []
+    },
+    "β": {
+      "quality": 0.4441,
+      "manual": false,
+      "categories": []
+    },
+    "γ": {
+      "quality": 0.4569,
+      "manual": false,
+      "categories": []
+    },
+    "δ": {
+      "quality": 0.2338,
+      "manual": false,
+      "categories": []
+    },
+    "ε": {
+      "quality": 0.2863,
+      "manual": false,
+      "categories": []
+    },
+    "ζ": {
+      "quality": 0.2428,
+      "manual": false,
+      "categories": []
+    },
+    "θ": {
+      "quality": 0.249,
+      "manual": false,
+      "categories": []
+    },
+    "ι": {
+      "quality": 0.5612,
+      "manual": false,
+      "categories": []
+    },
+    "ν": {
+      "quality": 0.439,
+      "manual": true,
+      "categories": []
+    },
+    "ξ": {
+      "quality": 0.3417,
+      "manual": true,
+      "categories": []
+    },
+    "π": {
+      "quality": 0.6269,
+      "manual": true,
+      "categories": []
+    },
+    "ρ": {
+      "quality": 0.3259,
+      "manual": false,
+      "categories": []
+    },
+    "ς": {
+      "quality": 0.3959,
+      "manual": false,
+      "categories": []
+    },
+    "σ": {
+      "quality": 0.1623,
+      "manual": false,
+      "categories": []
+    },
+    "υ": {
+      "quality": 0.0502,
+      "manual": false,
+      "categories": []
+    },
+    "φ": {
+      "quality": 0.5662,
+      "manual": true,
+      "categories": []
+    },
+    "‒": {
+      "quality": 0.9246,
+      "manual": false,
+      "categories": [
+        "sparse"
+      ]
+    },
+    "‘": {
+      "quality": 0.7783,
+      "manual": false,
+      "categories": []
+    },
+    "‚": {
+      "quality": 0.7802,
+      "manual": false,
+      "categories": []
+    },
+    "„": {
+      "quality": 0.314,
+      "manual": false,
+      "categories": []
+    },
+    "†": {
+      "quality": 0.4387,
+      "manual": true,
+      "categories": []
+    },
+    "‡": {
+      "quality": 0.46,
+      "manual": true,
+      "categories": []
+    },
+    "•": {
+      "quality": 0.4538,
+      "manual": true,
+      "categories": []
+    },
+    "‣": {
+      "quality": 0.5281,
+      "manual": true,
+      "categories": []
+    },
+    "…": {
+      "quality": 0.5908,
+      "manual": false,
+      "categories": []
+    },
+    "′": {
+      "quality": 0.776,
+      "manual": false,
+      "categories": []
+    },
+    "″": {
+      "quality": 0.3138,
+      "manual": false,
+      "categories": []
+    },
+    "‴": {
+      "quality": 0.5228,
+      "manual": false,
+      "categories": []
+    },
+    "‹": {
+      "quality": 0.4284,
+      "manual": false,
+      "categories": []
+    },
+    "›": {
+      "quality": 0.4288,
+      "manual": false,
+      "categories": []
+    },
+    "⁃": {
+      "quality": 0.7761,
+      "manual": false,
+      "categories": []
+    },
+    "⁄": {
+      "quality": 0.9613,
+      "manual": false,
+      "categories": []
+    },
+    "⁰": {
+      "quality": 0.4475,
+      "manual": true,
+      "categories": []
+    },
+    "⁴": {
+      "quality": 0.4996,
+      "manual": true,
+      "categories": []
+    },
+    "⁵": {
+      "quality": 0.4393,
+      "manual": true,
+      "categories": []
+    },
+    "⁶": {
+      "quality": 0.52,
+      "manual": true,
+      "categories": []
+    },
+    "⁷": {
+      "quality": 0.4646,
+      "manual": true,
+      "categories": []
+    },
+    "⁸": {
+      "quality": 0.5856,
+      "manual": true,
+      "categories": []
+    },
+    "⁹": {
+      "quality": 0.4152,
+      "manual": true,
+      "categories": []
+    },
+    "⁺": {
+      "quality": 0.25,
+      "manual": true,
+      "categories": []
+    },
+    "⁻": {
+      "quality": 0.879,
+      "manual": false,
+      "categories": [
+        "sparse"
+      ]
+    },
+    "⁼": {
+      "quality": 0.7753,
+      "manual": true,
+      "categories": []
+    },
+    "⁽": {
+      "quality": 0.8273,
+      "manual": false,
+      "categories": []
+    },
+    "⁾": {
+      "quality": 0.8292,
+      "manual": false,
+      "categories": []
+    },
+    "ⁿ": {
+      "quality": 0.1059,
+      "manual": false,
+      "categories": []
+    },
+    "←": {
+      "quality": 0.4156,
+      "manual": true,
+      "categories": [
+        "letter"
+      ]
+    },
+    "↑": {
+      "quality": 0.398,
+      "manual": false,
+      "categories": [
+        "letter"
+      ]
+    },
+    "→": {
+      "quality": 0.517,
+      "manual": true,
+      "categories": [
+        "letter"
+      ]
+    },
+    "↓": {
+      "quality": 0.4015,
+      "manual": false,
+      "categories": [
+        "letter"
+      ]
+    },
+    "↔": {
+      "quality": 0.3444,
+      "manual": false,
+      "categories": [
+        "letter"
+      ]
+    },
+    "↕": {
+      "quality": 0.5013,
+      "manual": false,
+      "categories": [
+        "letter"
+      ]
+    },
+    "↖": {
+      "quality": 0.3682,
+      "manual": false,
+      "categories": [
+        "letter"
+      ]
+    },
+    "↗": {
+      "quality": 0.3689,
+      "manual": false,
+      "categories": [
+        "letter"
+      ]
+    },
+    "↘": {
+      "quality": 0.365,
+      "manual": false,
+      "categories": [
+        "letter"
+      ]
+    },
+    "↙": {
+      "quality": 0.3642,
+      "manual": false,
+      "categories": [
+        "letter"
+      ]
+    },
+    "⇧": {
+      "quality": 0.5,
+      "manual": true,
+      "categories": []
+    },
+    "∂": {
+      "quality": 0.3058,
+      "manual": false,
+      "categories": []
+    },
+    "∏": {
+      "quality": 0.5083,
+      "manual": false,
+      "categories": []
+    },
+    "∓": {
+      "quality": 0.1859,
+      "manual": false,
+      "categories": []
+    },
+    "∙": {
+      "quality": 0.3027,
+      "manual": true,
+      "categories": []
+    },
+    "√": {
+      "quality": 0.4797,
+      "manual": true,
+      "categories": []
+    },
+    "∞": {
+      "quality": 0.2756,
+      "manual": false,
+      "categories": []
+    },
+    "∫": {
+      "quality": 0.8388,
+      "manual": false,
+      "categories": []
+    },
+    "≈": {
+      "quality": 0.6117,
+      "manual": true,
+      "categories": [
+        "vert"
+      ]
+    },
+    "≠": {
+      "quality": 0.2495,
+      "manual": false,
+      "categories": []
+    },
+    "≤": {
+      "quality": 0.649,
+      "manual": true,
+      "categories": [
+        "vert",
+        "dot"
+      ]
+    },
+    "≥": {
+      "quality": 0.5522,
+      "manual": true,
+      "categories": [
+        "vert",
+        "dot"
+      ]
+    },
+    "⌃": {
+      "quality": 0.2598,
+      "manual": false,
+      "categories": []
+    },
+    "⌥": {
+      "quality": 0.4775,
+      "manual": false,
+      "categories": []
+    },
+    "⌦": {
+      "quality": 0.0781,
+      "manual": false,
+      "categories": []
+    },
+    "⌧": {
+      "quality": 0.0946,
+      "manual": false,
+      "categories": []
+    },
+    "⌫": {
+      "quality": 0.0787,
+      "manual": false,
+      "categories": []
+    },
+    "⏎": {
+      "quality": 0.248,
+      "manual": false,
+      "categories": []
+    },
+    "─": {
+      "quality": 0.9212,
+      "manual": false,
+      "categories": [
+        "diag",
+        "sparse"
+      ]
+    },
+    "━": {
+      "quality": 0.8269,
+      "manual": true,
+      "categories": [
+        "sparse"
+      ]
+    },
+    "│": {
+      "quality": 0.971,
+      "manual": false,
+      "categories": [
+        "diag"
+      ]
+    },
+    "┃": {
+      "quality": 0.9336,
+      "manual": false,
+      "categories": []
+    },
+    "┄": {
+      "quality": 0.7031,
+      "manual": false,
+      "categories": []
+    },
+    "┅": {
+      "quality": 0.2852,
+      "manual": false,
+      "categories": []
+    },
+    "┆": {
+      "quality": 0.8649,
+      "manual": false,
+      "categories": []
+    },
+    "┇": {
+      "quality": 0.7068,
+      "manual": false,
+      "categories": []
+    },
+    "┈": {
+      "quality": 0.7956,
+      "manual": false,
+      "categories": []
+    },
+    "┉": {
+      "quality": 0.5636,
+      "manual": false,
+      "categories": []
+    },
+    "┊": {
+      "quality": 0.8581,
+      "manual": false,
+      "categories": []
+    },
+    "┋": {
+      "quality": 0.6918,
+      "manual": false,
+      "categories": []
+    },
+    "┌": {
+      "quality": 0.7125,
+      "manual": true,
+      "categories": [
+        "diag"
+      ]
+    },
+    "┍": {
+      "quality": 0.5393,
+      "manual": false,
+      "categories": []
+    },
+    "┎": {
+      "quality": 0.5375,
+      "manual": false,
+      "categories": []
+    },
+    "┏": {
+      "quality": 0.5229,
+      "manual": false,
+      "categories": []
+    },
+    "┐": {
+      "quality": 0.773,
+      "manual": true,
+      "categories": [
+        "diag",
+        "letter"
+      ]
+    },
+    "┑": {
+      "quality": 0.5393,
+      "manual": false,
+      "categories": []
+    },
+    "┒": {
+      "quality": 0.5378,
+      "manual": false,
+      "categories": []
+    },
+    "┓": {
+      "quality": 0.5232,
+      "manual": false,
+      "categories": []
+    },
+    "└": {
+      "quality": 0.7941,
+      "manual": true,
+      "categories": [
+        "diag",
+        "letter"
+      ]
+    },
+    "┕": {
+      "quality": 0.4916,
+      "manual": true,
+      "categories": []
+    },
+    "┖": {
+      "quality": 0.3487,
+      "manual": true,
+      "categories": []
+    },
+    "┗": {
+      "quality": 0.3319,
+      "manual": true,
+      "categories": []
+    },
+    "┘": {
+      "quality": 0.6767,
+      "manual": true,
+      "categories": [
+        "diag"
+      ]
+    },
+    "┙": {
+      "quality": 0.5416,
+      "manual": true,
+      "categories": []
+    },
+    "┚": {
+      "quality": 0.549,
+      "manual": true,
+      "categories": []
+    },
+    "┛": {
+      "quality": 0.4822,
+      "manual": true,
+      "categories": []
+    },
+    "├": {
+      "quality": 0.7949,
+      "manual": false,
+      "categories": [
+        "diag"
+      ]
+    },
+    "┝": {
+      "quality": 0.7524,
+      "manual": false,
+      "categories": []
+    },
+    "┞": {
+      "quality": 0.5969,
+      "manual": true,
+      "categories": []
+    },
+    "┟": {
+      "quality": 0.5928,
+      "manual": true,
+      "categories": []
+    },
+    "┠": {
+      "quality": 0.6024,
+      "manual": true,
+      "categories": []
+    },
+    "┡": {
+      "quality": 0.562,
+      "manual": true,
+      "categories": []
+    },
+    "┢": {
+      "quality": 0.5546,
+      "manual": true,
+      "categories": []
+    },
+    "┣": {
+      "quality": 0.5718,
+      "manual": true,
+      "categories": []
+    },
+    "┤": {
+      "quality": 0.7258,
+      "manual": true,
+      "categories": [
+        "diag"
+      ]
+    },
+    "┥": {
+      "quality": 0.7524,
+      "manual": false,
+      "categories": []
+    },
+    "┦": {
+      "quality": 0.6471,
+      "manual": true,
+      "categories": []
+    },
+    "┧": {
+      "quality": 0.643,
+      "manual": true,
+      "categories": []
+    },
+    "┨": {
+      "quality": 0.6026,
+      "manual": true,
+      "categories": []
+    },
+    "┩": {
+      "quality": 0.5622,
+      "manual": true,
+      "categories": []
+    },
+    "┪": {
+      "quality": 0.6048,
+      "manual": true,
+      "categories": []
+    },
+    "┫": {
+      "quality": 0.5721,
+      "manual": true,
+      "categories": []
+    },
+    "┬": {
+      "quality": 0.5057,
+      "manual": true,
+      "categories": [
+        "diag"
+      ]
+    },
+    "┭": {
+      "quality": 0.2117,
+      "manual": true,
+      "categories": []
+    },
+    "┮": {
+      "quality": 0.3117,
+      "manual": true,
+      "categories": []
+    },
+    "┯": {
+      "quality": 0.1978,
+      "manual": true,
+      "categories": []
+    },
+    "┰": {
+      "quality": 0.2479,
+      "manual": true,
+      "categories": []
+    },
+    "┱": {
+      "quality": 0.363,
+      "manual": true,
+      "categories": []
+    },
+    "┲": {
+      "quality": 0.3631,
+      "manual": true,
+      "categories": []
+    },
+    "┳": {
+      "quality": 0.35,
+      "manual": true,
+      "categories": []
+    },
+    "┴": {
+      "quality": 0.6025,
+      "manual": true,
+      "categories": [
+        "diag"
+      ]
+    },
+    "┵": {
+      "quality": 0.2991,
+      "manual": false,
+      "categories": []
+    },
+    "┶": {
+      "quality": 0.2991,
+      "manual": false,
+      "categories": []
+    },
+    "┷": {
+      "quality": 0.2408,
+      "manual": false,
+      "categories": []
+    },
+    "┸": {
+      "quality": 0.3865,
+      "manual": false,
+      "categories": []
+    },
+    "┹": {
+      "quality": 0.3704,
+      "manual": false,
+      "categories": []
+    },
+    "┺": {
+      "quality": 0.3704,
+      "manual": false,
+      "categories": []
+    },
+    "┻": {
+      "quality": 0.3263,
+      "manual": false,
+      "categories": []
+    },
+    "┼": {
+      "quality": 0.5852,
+      "manual": true,
+      "categories": [
+        "diag"
+      ]
+    },
+    "┽": {
+      "quality": 0.4238,
+      "manual": true,
+      "categories": []
+    },
+    "┾": {
+      "quality": 0.3738,
+      "manual": true,
+      "categories": []
+    },
+    "┿": {
+      "quality": 0.3742,
+      "manual": true,
+      "categories": []
+    },
+    "╀": {
+      "quality": 0.4509,
+      "manual": true,
+      "categories": []
+    },
+    "╁": {
+      "quality": 0.4936,
+      "manual": true,
+      "categories": []
+    },
+    "╂": {
+      "quality": 0.4721,
+      "manual": true,
+      "categories": []
+    },
+    "╃": {
+      "quality": 0.4159,
+      "manual": true,
+      "categories": []
+    },
+    "╄": {
+      "quality": 0.4659,
+      "manual": true,
+      "categories": []
+    },
+    "╅": {
+      "quality": 0.4559,
+      "manual": true,
+      "categories": []
+    },
+    "╆": {
+      "quality": 0.5058,
+      "manual": true,
+      "categories": []
+    },
+    "╇": {
+      "quality": 0.5272,
+      "manual": true,
+      "categories": []
+    },
+    "╈": {
+      "quality": 0.5143,
+      "manual": true,
+      "categories": []
+    },
+    "╉": {
+      "quality": 0.4915,
+      "manual": true,
+      "categories": []
+    },
+    "╊": {
+      "quality": 0.5415,
+      "manual": true,
+      "categories": []
+    },
+    "╋": {
+      "quality": 0.5092,
+      "manual": true,
+      "categories": []
+    },
+    "╌": {
+      "quality": 0.7701,
+      "manual": false,
+      "categories": []
+    },
+    "╍": {
+      "quality": 0.4979,
+      "manual": false,
+      "categories": []
+    },
+    "╎": {
+      "quality": 0.8777,
+      "manual": false,
+      "categories": []
+    },
+    "╏": {
+      "quality": 0.7346,
+      "manual": false,
+      "categories": []
+    },
+    "═": {
+      "quality": 0.6048,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "║": {
+      "quality": 0.7584,
+      "manual": true,
+      "categories": [
+        "dense"
+      ]
+    },
+    "╒": {
+      "quality": 0.6715,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╓": {
+      "quality": 0.5881,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╔": {
+      "quality": 0.6881,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╕": {
+      "quality": 0.6101,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╖": {
+      "quality": 0.6427,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╗": {
+      "quality": 0.6801,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╘": {
+      "quality": 0.6307,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╙": {
+      "quality": 0.6467,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╚": {
+      "quality": 0.6021,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╛": {
+      "quality": 0.5858,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╜": {
+      "quality": 0.598,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╝": {
+      "quality": 0.6286,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╞": {
+      "quality": 0.6759,
+      "manual": false,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╟": {
+      "quality": 0.7228,
+      "manual": true,
+      "categories": [
+        "dense"
+      ]
+    },
+    "╠": {
+      "quality": 0.7085,
+      "manual": true,
+      "categories": [
+        "dense"
+      ]
+    },
+    "╡": {
+      "quality": 0.7032,
+      "manual": true,
+      "categories": [
+        "diag"
+      ]
+    },
+    "╢": {
+      "quality": 0.6475,
+      "manual": true,
+      "categories": [
+        "dense"
+      ]
+    },
+    "╣": {
+      "quality": 0.6275,
+      "manual": true,
+      "categories": [
+        "dense"
+      ]
+    },
+    "╤": {
+      "quality": 0.6316,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╥": {
+      "quality": 0.6048,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╦": {
+      "quality": 0.5615,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╧": {
+      "quality": 0.6765,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╨": {
+      "quality": 0.6331,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╩": {
+      "quality": 0.6117,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╪": {
+      "quality": 0.6296,
+      "manual": true,
+      "categories": [
+        "curve"
+      ]
+    },
+    "╫": {
+      "quality": 0.6385,
+      "manual": true,
+      "categories": [
+        "dense"
+      ]
+    },
+    "╬": {
+      "quality": 0.7196,
+      "manual": true,
+      "categories": [
+        "dense"
+      ]
+    },
+    "╭": {
+      "quality": 0.7369,
+      "manual": true,
+      "categories": []
+    },
+    "╮": {
+      "quality": 0.7374,
+      "manual": true,
+      "categories": []
+    },
+    "╯": {
+      "quality": 0.7384,
+      "manual": false,
+      "categories": []
+    },
+    "╰": {
+      "quality": 0.7382,
+      "manual": false,
+      "categories": []
+    },
+    "╱": {
+      "quality": 0.9659,
+      "manual": false,
+      "categories": []
+    },
+    "╲": {
+      "quality": 0.9659,
+      "manual": false,
+      "categories": []
+    },
+    "╳": {
+      "quality": 0.4516,
+      "manual": false,
+      "categories": []
+    },
+    "╴": {
+      "quality": 0.8333,
+      "manual": false,
+      "categories": []
+    },
+    "╵": {
+      "quality": 0.9473,
+      "manual": false,
+      "categories": []
+    },
+    "╶": {
+      "quality": 0.8333,
+      "manual": false,
+      "categories": []
+    },
+    "╷": {
+      "quality": 0.9262,
+      "manual": false,
+      "categories": []
+    },
+    "╸": {
+      "quality": 0.6414,
+      "manual": false,
+      "categories": []
+    },
+    "╹": {
+      "quality": 0.8772,
+      "manual": false,
+      "categories": []
+    },
+    "╺": {
+      "quality": 0.6414,
+      "manual": false,
+      "categories": []
+    },
+    "╻": {
+      "quality": 0.829,
+      "manual": false,
+      "categories": []
+    },
+    "╼": {
+      "quality": 0.8498,
+      "manual": false,
+      "categories": []
+    },
+    "╽": {
+      "quality": 0.9441,
+      "manual": false,
+      "categories": []
+    },
+    "╾": {
+      "quality": 0.8498,
+      "manual": false,
+      "categories": []
+    },
+    "╿": {
+      "quality": 0.9448,
+      "manual": false,
+      "categories": []
+    },
+    "▀": {
+      "quality": 0.7,
+      "manual": true,
+      "categories": [
+        "corner"
+      ]
+    },
+    "▁": {
+      "quality": 0.8414,
+      "manual": false,
+      "categories": [
+        "sparse"
+      ]
+    },
+    "▂": {
+      "quality": 0.676,
+      "manual": true,
+      "categories": [
+        "sparse"
+      ]
+    },
+    "▃": {
+      "quality": 0.722,
+      "manual": true,
+      "categories": []
+    },
+    "▄": {
+      "quality": 0.35,
+      "manual": true,
+      "categories": [
+        "corner"
+      ]
+    },
+    "▅": {
+      "quality": 0.3296,
+      "manual": true,
+      "categories": []
+    },
+    "▆": {
+      "quality": 0.3,
+      "manual": true,
+      "categories": []
+    },
+    "▇": {
+      "quality": 0.3137,
+      "manual": true,
+      "categories": []
+    },
+    "█": {
+      "quality": 0.8105,
+      "manual": true,
+      "categories": [
+        "corner"
+      ]
+    },
+    "▌": {
+      "quality": 0.7305,
+      "manual": true,
+      "categories": [
+        "corner"
+      ]
+    },
+    "▎": {
+      "quality": 0.9034,
+      "manual": false,
+      "categories": []
+    },
+    "▏": {
+      "quality": 0.967,
+      "manual": false,
+      "categories": []
+    },
+    "▐": {
+      "quality": 0.7448,
+      "manual": true,
+      "categories": [
+        "corner"
+      ]
+    },
+    "░": {
+      "quality": 1.0,
+      "manual": true,
+      "categories": [
+        "corner"
+      ]
+    },
+    "▒": {
+      "quality": 1.0,
+      "manual": true,
+      "categories": [
+        "corner"
+      ]
+    },
+    "▓": {
+      "quality": 1.0,
+      "manual": true,
+      "categories": [
+        "corner"
+      ]
+    },
+    "▔": {
+      "quality": 0.8348,
+      "manual": false,
+      "categories": []
+    },
+    "▕": {
+      "quality": 0.9665,
+      "manual": false,
+      "categories": []
+    },
+    "▖": {
+      "quality": 0.4078,
+      "manual": false,
+      "categories": []
+    },
+    "▗": {
+      "quality": 0.4078,
+      "manual": false,
+      "categories": []
+    },
+    "▘": {
+      "quality": 0.4085,
+      "manual": false,
+      "categories": []
+    },
+    "▙": {
+      "quality": 0.4805,
+      "manual": false,
+      "categories": []
+    },
+    "▚": {
+      "quality": 0.6149,
+      "manual": false,
+      "categories": []
+    },
+    "▛": {
+      "quality": 0.4811,
+      "manual": false,
+      "categories": []
+    },
+    "▜": {
+      "quality": 0.4811,
+      "manual": false,
+      "categories": []
+    },
+    "▝": {
+      "quality": 0.4085,
+      "manual": false,
+      "categories": []
+    },
+    "▞": {
+      "quality": 0.6149,
+      "manual": false,
+      "categories": []
+    },
+    "▟": {
+      "quality": 0.4805,
+      "manual": false,
+      "categories": []
+    },
+    "■": {
+      "quality": 0.5734,
+      "manual": true,
+      "categories": [
+        "corner"
+      ]
+    },
+    "□": {
+      "quality": 0.7,
+      "manual": true,
+      "categories": []
+    },
+    "▲": {
+      "quality": 0.25,
+      "manual": true,
+      "categories": []
+    },
+    "▴": {
+      "quality": 0.1032,
+      "manual": false,
+      "categories": []
+    },
+    "▶": {
+      "quality": 0.005,
+      "manual": false,
+      "categories": []
+    },
+    "▼": {
+      "quality": 0.0771,
+      "manual": false,
+      "categories": []
+    },
+    "▾": {
+      "quality": 0.085,
+      "manual": false,
+      "categories": []
+    },
+    "◀": {
+      "quality": 0.0043,
+      "manual": false,
+      "categories": []
+    },
+    "◂": {
+      "quality": 0.0268,
+      "manual": false,
+      "categories": []
+    },
+    "◊": {
+      "quality": 0.4767,
+      "manual": false,
+      "categories": []
+    },
+    "○": {
+      "quality": 0.0074,
+      "manual": false,
+      "categories": []
+    },
+    "●": {
+      "quality": 0.0115,
+      "manual": false,
+      "categories": []
+    },
+    "◦": {
+      "quality": 0.0128,
+      "manual": false,
+      "categories": []
+    }
+  }
+}

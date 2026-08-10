@@ -1,0 +1,15 @@
+{
+  "font": "/System/Applications/Utilities/Terminal.app/Contents/Resources/Fonts/SF-Mono-Regular.otf",
+  "terminal_size": 14,
+  "size": 29.118483412322274,
+  "baseline_y": 27.72511848341232,
+  "cell_h": 36,
+  "cell_w": 18,
+  "charset_file": "kits/sfmono/charset_curated.txt",
+  "recipe": {
+    "coord_weight_end": 0.03,
+    "coord_weight_end_frac": 0.4,
+    "pool_join_coord_sigma": 0.2,
+    "vae_ckpt": "weights/vae_sfmono/model.pt"
+  }
+}

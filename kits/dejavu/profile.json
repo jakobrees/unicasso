@@ -1,0 +1,16 @@
+{
+  "font": "fonts/DejaVuSansMono.ttf",
+  "terminal_size": 14,
+  "size": 26.575831305758314,
+  "baseline_y": 24.66828872668289,
+  "cell_h": 34,
+  "cell_w": 16,
+  "charset_file": "kits/dejavu/charset_curated.txt",
+  "recipe": {
+    "coord_weight_end": 0.02,
+    "coord_weight_end_frac": 0.25,
+    "pool_join_coord_sigma": 0.4,
+    "ban_chars": "▀",
+    "vae_ckpt": "weights/vae_dejavu/model.pt"
+  }
+}
