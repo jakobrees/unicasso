@@ -83,21 +83,18 @@ pip install -e .
 unicasso path/to/image.jpg                 # or: python -m unicasso.engine.asciify
 ```
 
-That is the whole command — **the defaults are the canonical recipe** (the
-~100-flag invocation these renders were developed with), recorded in
-[`canonical_recipe.args`](unicasso/engine/canonical_recipe.args) and enforced by
-`python -m unicasso.engine.test_recipe`. A render is ~1 h on an M-series Mac at
-the default 3500 iterations (~2 h with the adapter). For an *instant* result,
-the distilled **unicasso-lite** models do it in a single forward pass (well
-under a second) — see [Distilled models](#distilled-models). For a fast preview
-of the optimizer itself:
+The defaults encode the canonical recipe
+([`canonical_recipe.args`](unicasso/engine/canonical_recipe.args), tested by
+`python -m unicasso.engine.test_recipe`). A render takes ~1 h on an M-series
+Mac at 3500 iterations (~2 h with the adapter). For a single-pass result
+(<1 s), see [Distilled models](#distilled-models). For a fast preview:
 
 ```bash
 unicasso image.jpg --iters 300 --progress-every 25    # rough sketch in minutes,
                                                       # state snapshots in <out>_progress/
 ```
 
-Flags worth reaching for first (full list in [`docs/flags.md`](docs/flags.md)):
+Common flags (full list in [`docs/flags.md`](docs/flags.md)):
 
 | flag | does |
 |---|---|
@@ -113,12 +110,8 @@ The `.txt` files next to the renders in [`examples/`](examples/) are actual outp
 
 **Model downloads.** The first run fetches CLIP RN101 (~280 MB) and, for the
 affinity term, DINOv3 ViT-B/16 (~350 MB) via `timm`. Both download without a
-HuggingFace account. **If the DINOv3 fetch fails the run continues** without
-affinity, after a loud warning, so nothing here is a hard dependency.
-
-On stock Ubuntu, the distro's system Pillow (9.0.x in `dist-packages`) can
-shadow pip's and break both font rendering and the lineart tools — if you see
-`Resampling` or fractional-font-size errors, `pip install -U pillow` fixes it.
+HuggingFace account. If the DINOv3 fetch fails, the run continues
+without affinity.
 
 **Font kits.** `dejavu` (DejaVu Sans Mono, bundled, OFL) is the default and
 fully redistributable; its glyph-VAE ships in `weights/vae_dejavu/`. On a Mac,
@@ -130,13 +123,11 @@ redistributable, so it works on a Mac and nowhere else):
 GLYPHVAE_FONT=sfmono python -m unicasso.engine.asciify path/to/image.jpg
 ```
 
-Each kit's `profile.json` carries the handful of genuinely
-font-dependent settings. To onboard your own monospace font — build a kit,
+Each kit's `profile.json` carries the font-dependent settings. To onboard your own monospace font — build a kit,
 curate a charset, train its VAE — follow **[docs/fonts.md](docs/fonts.md)**.
 
 **CLIP domain adaptation (optional).** `weights/clip_adapter/` ships adapters
-that shift CLIP toward ASCII renders — off by default (mainly speed), worth
-enabling if you see lines overshooting their endpoints. The shipped pair was
+that shift CLIP toward ASCII renders — off by default. The shipped pair was
 trained on SF Mono renders, so it pairs naturally with the `sfmono` kit:
 
 ```bash
@@ -180,9 +171,8 @@ toward all along. With `--color`, per-cell fg/bg colors are the closed-form
 least-squares fit to the target under the current glyph — recomputed every
 step, so color is optimized *with* the glyphs, not painted on after.
 
-This is a heavy simplification — and the schedules carry real weight: what
-anneals when (temperatures, weight caps, noise, loss ramps) shapes the search
-as much as the loss terms do. The latent-structuring objectives the VAE is
+The schedules (temperatures, weight caps, noise, loss ramps) shape the
+search as much as the loss terms do. The latent-structuring objectives the VAE is
 trained with, the loss terms that exploit that structure (e.g. the coordinate
 readout), the size-weighted crop sampling in the CLIP passes, the
 admission/eviction rules, and the schedule design are detailed in the
@@ -198,13 +188,9 @@ per-cell transformer glyph classifier trained on the swarm optimizer's own
 renders. No CLIP, no search — a photo becomes ANSI in well under a second
 instead of an hour.
 
-The quality cost is real and worth stating plainly. It gets the broad
-structure — overall tone, large shapes, the layout — but a per-cell classifier
-has no global objective coupling cells, so the things the optimizer's CLIP loss
-works hardest to preserve are exactly what it drops: semantically important
-regions are under-served, and small-but-important objects and sub-cell details
-tend to disappear. Use it when you want a fast, broadly-faithful render; reach
-for the optimizer when those details matter.
+A per-cell classifier has no global objective coupling cells, so it
+reproduces broad tone and layout but drops sub-cell detail and
+semantically important regions that the optimizer's CLIP loss preserves.
 
 ```bash
 python -m unicasso.lite photo.jpg --width 60          # 24-bit ANSI to stdout
