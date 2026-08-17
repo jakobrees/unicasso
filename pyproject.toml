@@ -26,6 +26,7 @@ dependencies = [
 
 [project.scripts]
 unicasso = "unicasso.engine.asciify:main"
+unicasso-lite = "unicasso.lite:main"
 
 [project.urls]
 Repository = "https://github.com/jakobrees/unicasso"

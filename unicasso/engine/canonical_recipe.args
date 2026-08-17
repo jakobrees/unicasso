@@ -47,3 +47,4 @@
 --empty-weight 0.18 --empty-temp-scale 0.3 --empty-thresh 0.95 --empty-window 5 --empty-gamma 2.0
 --empty-anneal 1 --empty-noise-scale 0.3 --empty-clean-target --empty-clean-sigma 4.0
 --clip-content-crop --clip-content-pad 2 --target-white 0.9
+--early-stop-patience 6 --early-stop-every 50 --early-stop-div-window 50 --early-stop-div-tol 0.02 --early-stop-frac 0.86

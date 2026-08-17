@@ -57,6 +57,12 @@ def main():
     ap.add_argument("--clip-aug", type=int, default=8)
     ap.add_argument("--clip-crop-scale", type=float, nargs=2, default=(0.4, 0.9))
     ap.add_argument("--ridge", type=float, default=1e-3)
+    ap.add_argument("--color-source", default="blend", choices=["fit", "cluster", "blend"],
+                    help="base fg0/bg0: plain MSE fit, decompose cluster colors, or the "
+                         "engine-default mix (--color-cluster-alpha)")
+    ap.add_argument("--color-cluster-alpha", type=float, default=0.5)
+    ap.add_argument("--color-bg-dist-pow", type=float, default=1.0,
+                    help="bg-fit votes ~ (distance to the glyph's ink)^pow; 0 = plain")
     args = ap.parse_args()
 
     dev = torch.device("mps" if torch.backends.mps.is_available()
@@ -75,7 +81,19 @@ def main():
     img = torch.from_numpy(np.asarray(im, np.float32) / 255.0).to(dev)
     cells = img.reshape(GH, CH, GW, CW, 3).permute(0, 2, 1, 3, 4).reshape(M, CH * CW, 3)
     mask = ink.reshape(N, CH * CW)[gid].to(dev)                          # (M,P) ink=1
-    fg0, bg0 = fit_fg_bg(cells, mask, ridge=args.ridge)                  # the MSE optimum
+    bg_w = None
+    if args.color_bg_dist_pow > 0:
+        from unicasso.engine.color import glyph_bg_dist
+        bg_w = glyph_bg_dist(ink.reshape(N, CH * CW), CH, CW).to(dev)[gid] \
+            .pow(args.color_bg_dist_pow)
+    fg0, bg0 = fit_fg_bg(cells, mask, ridge=args.ridge, bg_w=bg_w)       # the MSE optimum
+    if args.color_source != "fit":
+        # engine-default shipped colors: mix in the decomposition's own cluster colors
+        from unicasso.engine.color import decompose
+        dec = decompose(img, GH, GW, CH, CW)
+        a = 1.0 if args.color_source == "cluster" else args.color_cluster_alpha
+        fg0 = a * dec["fg"].to(dev) + (1 - a) * fg0
+        bg0 = a * dec["bg"].to(dev) + (1 - a) * bg0
     mid = 0.5 * (fg0 + bg0)
     dfg, dbg = fg0 - mid, bg0 - mid
 

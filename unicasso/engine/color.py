@@ -154,21 +154,44 @@ def nomination_target(d):
 
 
 @torch.no_grad()
-def fit_fg_bg(cell_rgb, mask, ridge=1e-3):
+def fit_fg_bg(cell_rgb, mask, ridge=1e-3, bg_w=None):
     """Closed-form per-cell MSE fit of fg/bg for a given ink mask -- the init for the
     per-slot color leaves, and the emission-time fit.
 
     Minimizes ||bg + (fg-bg)*m - c||^2 over the cell:
         fg = weighted mean of c under m, bg = weighted mean under (1-m)
     cell_rgb (M,P,3), mask (M,P) in [0,1] -> fg (M,3), bg (M,3).
-    `ridge` keeps a near-empty or near-full mask from producing a wild color."""
+    `ridge` keeps a near-empty or near-full mask from producing a wild color.
+    `bg_w` (M,P): extra per-pixel bg weights (e.g. glyph_bg_dist^pow -- pixels hugging
+    the stroke carry antialiasing/misalignment contamination and should barely vote)."""
     w = mask.clamp(0, 1)
+    wc = (1 - w) if bg_w is None else (1 - w) * bg_w
     sw = w.sum(1, keepdim=True)
-    sc = (1 - w).sum(1, keepdim=True)
+    sc = wc.sum(1, keepdim=True)
     mean = cell_rgb.mean(1)                                          # fallback for degenerate masks
     fg = ((w[:, :, None] * cell_rgb).sum(1) + ridge * mean) / (sw + ridge).clamp_min(1e-6)
-    bg = (((1 - w)[:, :, None] * cell_rgb).sum(1) + ridge * mean) / (sc + ridge).clamp_min(1e-6)
+    bg = ((wc[:, :, None] * cell_rgb).sum(1) + ridge * mean) / (sc + ridge).clamp_min(1e-6)
     return fg, bg
+
+
+@torch.no_grad()
+def glyph_bg_dist(ink_flat, ch, cw):
+    """(N, P) glyph ink masks -> (N, P) distance of each pixel to the glyph's nearest
+    ink pixel, normalized per glyph to max 1. Ink-free glyphs (space) get uniform 1.
+    The bg-fit weight table for fit_fg_bg's `bg_w` (indexed by glyph, raised to a pow)."""
+    N, P = ink_flat.shape
+    ys, xs = torch.meshgrid(torch.arange(ch, dtype=torch.float32),
+                            torch.arange(cw, dtype=torch.float32), indexing="ij")
+    coords = torch.stack([ys.reshape(-1), xs.reshape(-1)], dim=1)    # (P, 2)
+    src = ink_flat.detach().cpu()
+    out = torch.ones(N, P)
+    for i in range(N):
+        pts = coords[src[i] > 0.5]
+        if len(pts) == 0:
+            continue
+        d = torch.cdist(coords, pts).min(dim=1).values
+        out[i] = d / d.max().clamp_min(1e-6)
+    return out.to(ink_flat.device)
 
 
 @torch.no_grad()

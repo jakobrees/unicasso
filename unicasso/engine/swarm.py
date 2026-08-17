@@ -83,6 +83,11 @@ class ParticleSwarm:
         self.color_fit_mc = 0.0          # in-loop legibility floor (= recolor's --min-contrast)
         self.color_fit_ridge = 1e-3
         self.color_fit_detach = False    # True -> colors track the shape but pass no gradient back
+        self.color_bg_dist = None        # (N,P) per-glyph bg-distance table (color.glyph_bg_dist)
+        self.color_bg_dist_pow = 0.0     # bg votes ~ dist^pow from the glyph's ink; 0 = plain fit
+        self.cluster_fg = None           # (M,3) decompose cluster colors -- blended into the fit
+        self.cluster_bg = None
+        self.cluster_alpha = 0.0         # cluster share of the shipped colors (0 = pure MSE fit)
         # Learned PER-CELL contrast, applied AFTER the min-contrast floor so k=1 reproduces the
         # fitted colors exactly and switching it on mid-run is continuous, not a step.
         self.k_contrast = nn.Parameter(torch.ones(M, device=device))
@@ -253,9 +258,10 @@ class ParticleSwarm:
         mid = 0.5 * (fg + bg)
         return mid + kk * (fg - mid), mid + kk * (bg - mid)
 
-    def _fit_colors(self, slot_img):
+    def _fit_colors(self, slot_img, slot_g=None):
         """Per-slot fg/bg as the CLOSED-FORM MSE optimum against the target cell, recomputed
         from each slot's OWN current ink every forward. In this mode fg/bg are NOT parameters.
+        slot_g (M,K): each slot's nearest glyph, for the bg-distance weighting.
 
         Why fit instead of learn. With free color leaves CLIP picks the colors, and CLIP
         optimizes perception, not pixel error -- pixel error lands several times worse,
@@ -286,8 +292,24 @@ class ParticleSwarm:
         sw = ink.sum(-1)                                             # (M,K) ink mass
         num_f = torch.einsum("mkp,mpc->mkc", ink, C)                 # (M,K,3)
         fg = (num_f + r * mean[:, None, :]) / (sw + r).clamp_min(1e-6)[:, :, None]
-        bg = ((C.sum(1)[:, None, :] - num_f) + r * mean[:, None, :]) \
-            / ((P - sw) + r).clamp_min(1e-6)[:, :, None]
+        if self.color_bg_dist is not None and self.color_bg_dist_pow > 0 and slot_g is not None:
+            # bg votes weighted by distance from the slot's nearest glyph's ink: stroke-fringe
+            # pixels (antialiasing / slight misalignment) barely count. The weights are constants
+            # w.r.t. the graph (detached index gather); gradient still flows through ink.
+            d = self.color_bg_dist[slot_g].pow(self.color_bg_dist_pow)  # (M,K,P)
+            wb = (1.0 - ink) * d
+            num_b = torch.einsum("mkp,mpc->mkc", wb, C)
+            bg = (num_b + r * mean[:, None, :]) / (wb.sum(-1) + r).clamp_min(1e-6)[:, :, None]
+        else:
+            bg = ((C.sum(1)[:, None, :] - num_f) + r * mean[:, None, :]) \
+                / ((P - sw) + r).clamp_min(1e-6)[:, :, None]
+        if self.cluster_fg is not None and self.cluster_alpha > 0:
+            # ship (and optimize against) a mix of the decomposition's own cluster colors and
+            # the fit: cluster preserves the cell's bimodal contrast and is glyph-independent;
+            # the fit keeps the rendered mean honest. Same mix at emission (fit_emit_colors).
+            a = self.cluster_alpha
+            fg = a * self.cluster_fg[:, None, :] + (1 - a) * fg
+            bg = a * self.cluster_bg[:, None, :] + (1 - a) * bg
         fg = self._mc_push(fg, bg)
         fg, bg = self._apply_k(fg, bg)
         # straight-through clamp: ship the clamped value but keep the gradient, since a hard
@@ -297,14 +319,22 @@ class ParticleSwarm:
         return self._quantize(fg, bg)
 
     @torch.no_grad()
-    def fit_emit_colors(self, mask):
+    def fit_emit_colors(self, mask, gidx=None):
         """fg/bg (M,3) for a HARD placed mask (M,P) -- the emission twin of `_fit_colors`.
 
         Without this, emission would read the stale `fg`/`bg` leaves (last written at seed or
         birth) while the loop had been optimizing against freshly fitted colors, so the shipped
-        .ans would not be the image that was optimized. Same fit, same floor, same palette."""
+        .ans would not be the image that was optimized. Same fit, same floor, same palette.
+        gidx (M,): placed glyph indices, for the bg-distance weighting."""
         from unicasso.engine.color import fit_fg_bg
-        fg, bg = fit_fg_bg(self.tgt_cell_rgb, mask, self.color_fit_ridge)
+        bg_w = None
+        if self.color_bg_dist is not None and self.color_bg_dist_pow > 0 and gidx is not None:
+            bg_w = self.color_bg_dist[gidx].pow(self.color_bg_dist_pow)
+        fg, bg = fit_fg_bg(self.tgt_cell_rgb, mask, self.color_fit_ridge, bg_w=bg_w)
+        if self.cluster_fg is not None and self.cluster_alpha > 0:
+            a = self.cluster_alpha
+            fg = a * self.cluster_fg + (1 - a) * fg
+            bg = a * self.cluster_bg + (1 - a) * bg
         fg = self._mc_push(fg, bg)
         fg, bg = self._apply_k(fg, bg)
         fg, bg = fg.clamp(0, 1), bg.clamp(0, 1)
@@ -393,7 +423,7 @@ class ParticleSwarm:
             # cell_rgb[m,p] = sum_k v_k * ( bg_k + (fg_k - bg_k) * ink_k[p] ),  ink = 1 - slot_img
             # Never materialize slot_rgb (M,K,P,3) -- at M=1800,K=3 that is 42MB/forward and it
             # scales with the grid; the two einsums below give (M,P,3) straight out.
-            fg, bg = (self._fit_colors(slot_img) if self.color_fit
+            fg, bg = (self._fit_colors(slot_img, idxk[:, 0].view(M, K)) if self.color_fit
                       else self._colors())                             # (M,K,3) each
             ink = 1.0 - slot_img                                         # (M,K,P)
             dcol = fg - bg                                               # (M,K,3)

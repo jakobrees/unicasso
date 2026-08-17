@@ -99,12 +99,12 @@ def check(kit, want, prof):
 
 
 COLOUR_MODE = {
-    # `--color` alone must give the colour recipe from glyphcolor/run_color_batch.sh.
+    # `--color` alone must give the canonical colour recipe.
     # --color-fit is the load-bearing one: probe_color = color and color_fit, so without
     # it live probing is silently disabled under --color and the run has no measured
     # tier at all (admissions on prediction, no evidence-based tabu, lottery births 0).
-    # --color-contrast-learn without --color-contrast-tv is the salt-and-pepper k field
-    # that drove 359 cells flat on leather_w60, so those two move together.
+    # --color-contrast-learn without --color-contrast-tv gives a salt-and-pepper k field
+    # (measured to drive whole regions flat), so those two move together.
     "color_fit": True,
     "color_contrast_learn": True,
     "color_contrast_tv": 0.05,
@@ -121,7 +121,7 @@ def check_colour():
     bad = [(k, v, getattr(args, k, "<MISSING>")) for k, v in COLOUR_MODE.items()
            if getattr(args, k, None) != v]
     n = len(COLOUR_MODE)
-    print(f"  colour: {n - len(bad)}/{n} settings match run_color_batch with just --color")
+    print(f"  colour: {n - len(bad)}/{n} settings match the canonical colour recipe with just --color")
     for k, w, g in bad:
         print(f"          MISMATCH {k:<28} want {w!r:<10} got {g!r}")
     return not bad

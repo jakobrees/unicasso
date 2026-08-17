@@ -89,7 +89,7 @@ class CLIPPerceptualLoss(nn.Module):
                  edge_frac=0.0, edge_beta=0.5, edge_auto=False,
                  vit_layers=((7, 1.0),), vit_drop_cls=False, fp16=False,
                  reg_frac=0.0, cell_h=24, cell_w=12, adapter=None, batch_aug=False,
-                 microbatch=0):
+                 microbatch=0, steer=None, steer_weight=0.0):
         super().__init__()
         model, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
         model = model.to(device).eval()
@@ -166,6 +166,27 @@ class CLIPPerceptualLoss(nn.Module):
                     p.requires_grad_(False)
             print(f"CLIP adapter: {adapter} ({len(self._adapters)} modules"
                   + (f", step {extra['step']}" if extra.get("step") else "") + ")")
+        # STEERING (engine/steer.py): a fixed unit direction in the joint image/text space,
+        # added to the normalized TARGET embedding before the semantic cosine. Asks for "the
+        # target, but ascii-flavoured". Only the fc/semantic term lives in a space text and
+        # image share, so this is the one term it can touch -- the geometric conv-map L2 and
+        # dense_loss are untouched. The cosine re-normalizes, so the loss stays bounded in
+        # [0,2] and only its DIRECTION moves; steer_weight is the whole knob.
+        self.steer, self.steer_w = None, float(steer_weight)
+        if steer is not None and self.steer_w != 0.0:
+            if self.is_vit or self.is_convnext:
+                raise ValueError("--clip-steer needs the joint-space fc embedding of an RN "
+                                 "model (ViT/ConvNeXt geometric terms are token/map L2)")
+            from unicasso.engine.steer import load_delta
+            d, rec = load_delta(steer, device)
+            if d.numel() != getattr(self.visual, "output_dim", d.numel()):
+                raise ValueError(f"steer dim {d.numel()} != visual output dim "
+                                 f"{self.visual.output_dim} ({steer})")
+            if rec.get("model") not in (None, model_name):
+                raise ValueError(f"steer vector was built for {rec['model']}, running "
+                                 f"{model_name} -- the embedding spaces differ")
+            self.steer = d.view(1, -1)
+            print(f"CLIP steer: {steer} (kind={rec.get('kind','?')}, lambda={self.steer_w})")
         self.vit_layers = list(vit_layers)          # [(resblock_idx, weight), ...]
         self.vit_drop_cls = vit_drop_cls
         self.layer_weights = layer_weights
@@ -357,14 +378,28 @@ class CLIPPerceptualLoss(nn.Module):
     def _pair_loss(self, fc, feats, ir, it, ia, alt_w, cons_w, B_total):
         """Loss for ONE render/target(/alt) triple living at rows (ir, it, ia) of a
         canonical-layout encode. Shared by the sequential and batched aug paths."""
-        sem = (1.0 - torch.cosine_similarity(fc[ir:ir + 1], fc[it:it + 1], dim=1)).mean()
+        fr, fa, ft = fc[ir:ir + 1], fc[ia:ia + 1] if ia is not None else None, fc[it:it + 1]
+        if self.steer is not None:
+            # ê_t* = normalize(ê_t + λ·Δ̂). cosine_similarity normalizes its arguments, so
+            # only the pre-add normalize is explicit here: without it λ would mean something
+            # different for every crop (embedding norms vary), and the knob would be useless.
+            # The component of Δ̂ parallel to ê_t cancels under the renormalization -- the
+            # ORTHOGONAL part is the entire steering effect (steer.py reports how big it is).
+            # fp32 on both sides here: under --clip-fp16 the encoder returns fp16 and the
+            # steered target is fp32, and cosine_similarity will not mix the two.
+            ft = F.normalize(ft.float(), dim=-1) + self.steer_w * self.steer
+            fr = fr.float()
+            fa = fa.float() if fa is not None else None
+        sem = (1.0 - torch.cosine_similarity(fr, ft, dim=1)).mean()
         l_main = self.fc_weight * sem
         l_alt = l_cons = fc.new_zeros(())
         if ia is not None:
+            # the VIP/snap plane is scored against the SAME steered target: it is the shipping
+            # image's copy of l_main, so a different target would make the two planes disagree
             l_alt = self.fc_weight * alt_w * (
-                1.0 - torch.cosine_similarity(fc[ia:ia + 1], fc[it:it + 1], dim=1)).mean()
+                1.0 - torch.cosine_similarity(fa, ft, dim=1)).mean()
             l_cons = self.fc_weight * cons_w * (
-                1.0 - torch.cosine_similarity(fc[ir:ir + 1], fc[ia:ia + 1], dim=1)).mean()
+                1.0 - torch.cosine_similarity(fr, fa, dim=1)).mean()
         if self.is_vit:                                  # geometric = L2 on transformer tokens
             vw = dict(self.vit_layers)
             for idx, tok in feats.items():

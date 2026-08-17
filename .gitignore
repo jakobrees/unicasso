@@ -10,3 +10,7 @@ data/
 
 # Apple SF Mono may live here locally for the sfmono kit; never commit it.
 kits/sfmono/fonts/
+
+# transient / dev scratch (analysis scripts, experiment runners, bundles)
+dist/
+scratch/

@@ -87,22 +87,34 @@ That is the whole command — **the defaults are the canonical recipe** (the
 ~100-flag invocation these renders were developed with), recorded in
 [`canonical_recipe.args`](unicasso/engine/canonical_recipe.args) and enforced by
 `python -m unicasso.engine.test_recipe`. A render is ~1 h on an M-series Mac at
-the default 3500 iterations (~2 h with the adapter). For a fast preview:
+the default 3500 iterations (~2 h with the adapter). For an *instant* result,
+the distilled **unicasso-lite** models do it in a single forward pass (well
+under a second) — see [Distilled models](#distilled-models). For a fast preview
+of the optimizer itself:
 
 ```bash
 unicasso image.jpg --iters 300 --progress-every 25    # rough sketch in minutes,
                                                       # state snapshots in <out>_progress/
 ```
 
-Useful flags: `--color`, `--qr`, `--seed`, `--output-text out.txt`. The `.txt`
-files next to the renders in [`examples/`](examples/) are actual outputs.
+Flags worth reaching for first (full list in [`docs/flags.md`](docs/flags.md)):
 
-**Model downloads.** The first run fetches CLIP RN101 (~280 MB). The affinity
-term uses DINOv3, which is gated on HuggingFace (accept the licence at
-[facebook/dinov3-vitb16-pretrain-lvd1689m](https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m)
-then `huggingface-cli login`); **if that download fails the run continues**
-without affinity, after a loud warning. Minimum working install: torch + RN101,
-no HuggingFace account.
+| flag | does |
+|---|---|
+| `--color` | 24-bit ANSI output (fg/bg fitted per cell); needs fewer iters |
+| `--base-width N` | grid width in characters (default 60) |
+| `--ban-chars "…"` / `--ban-blocks` / `--ban-letters` | drop glyphs from the charset |
+| `--iters N` | quality/speed trade-off (300 = quick sketch, 3500 = default) |
+| `--qr` | also emit a QR code carrying the artwork (see [artcode](#artcode)) |
+| `--seed N` | reproducible run |
+| `--output out.png` / `--output-text out.txt` | where to write |
+
+The `.txt` files next to the renders in [`examples/`](examples/) are actual outputs.
+
+**Model downloads.** The first run fetches CLIP RN101 (~280 MB) and, for the
+affinity term, DINOv3 ViT-B/16 (~350 MB) via `timm`. Both download without a
+HuggingFace account. **If the DINOv3 fetch fails the run continues** without
+affinity, after a loud warning, so nothing here is a hard dependency.
 
 On stock Ubuntu, the distro's system Pillow (9.0.x in `dist-packages`) can
 shadow pip's and break both font rendering and the lineart tools — if you see
@@ -177,7 +189,52 @@ admission/eviction rules, and the schedule design are detailed in the
 forthcoming paper. Until then, the most complete technical description in the
 repo is the module docstring of
 [`unicasso/engine/swarm.py`](unicasso/engine/swarm.py) — it derives the
-slot parameterization from the failure mode of its predecessor. Start there.
+slot parameterization from the failure mode of its predecessor.
+
+## Distilled models
+
+`unicasso-lite` is the optimizer distilled into a single feedforward pass: a
+per-cell transformer glyph classifier trained on the swarm optimizer's own
+renders. No CLIP, no search — a photo becomes ANSI in well under a second
+instead of an hour.
+
+The quality cost is real and worth stating plainly. It gets the broad
+structure — overall tone, large shapes, the layout — but a per-cell classifier
+has no global objective coupling cells, so the things the optimizer's CLIP loss
+works hardest to preserve are exactly what it drops: semantically important
+regions are under-served, and small-but-important objects and sub-cell details
+tend to disappear. Use it when you want a fast, broadly-faithful render; reach
+for the optimizer when those details matter.
+
+```bash
+python -m unicasso.lite photo.jpg --width 60          # 24-bit ANSI to stdout
+python -m unicasso.lite photo.jpg -w 80 --out art.ans # write a cat-able file
+python -m unicasso.lite drawing.png --line            # monochrome ASCII art (plain text, no color)
+```
+
+Two models ship in [`weights/lite/`](weights/lite/): **color** (per-cell Lab
+decomposition → glyph classifier → closed-form blend colors → learned per-cell
+contrast) and **line** (monochrome ASCII art, plain text). The color model takes
+any image; the **line model expects line art** — feed it a drawing, or convert a
+photo first (see [From photo to ASCII](#from-photo-to-ascii)). As a library:
+
+```python
+from unicasso.lite import Lite
+out = Lite("color").render("photo.jpg", width=60)
+print(out.ans)                                        # out.txt / out.glyphs / out.k also set
+```
+
+**In the terminal.** `pip install -e .` puts `unicasso-lite` on your PATH, and
+its stdout is clean ANSI — loader messages go to stderr, so it pipes and `cat`s
+cleanly and drops into anything that consumes a command's output. With no
+`--width` it fills the current terminal:
+
+```bash
+unicasso-lite photo.jpg                               # fills the terminal
+unicasso-lite photo.jpg -w 40 > logo.ans              # a fixed-width file
+```
+
+Build notes: [`docs/lite-devlog.md`](docs/lite-devlog.md).
 
 ## artcode
 

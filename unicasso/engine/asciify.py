@@ -329,7 +329,7 @@ def apply_profile_recipe(p):
     # Recipe path values name files the REPO owns, so they resolve against the repo
     # root, not the caller's cwd -- unlike the same flag typed on the command line,
     # which is the user's path and stays theirs.
-    PATH_KEYS = {"vae_ckpt", "clip_adapter", "init_vae_ckpt"}
+    PATH_KEYS = {"vae_ckpt", "clip_adapter", "clip_steer", "init_vae_ckpt"}
     use = {k: (G.repo_path(v) if k in PATH_KEYS and isinstance(v, str) else v)
            for k, v in rec.items() if k in valid}
     if use:
@@ -939,6 +939,17 @@ def parse_args():
                    help="domain-adaptation adapters from unicasso.adapter.clip_adapt (adapters_best.pt): "
                         "render/snap passes run the ascii-ADAPTED tower, target passes the frozen "
                         "base -- the dual-path wiring the adapters were trained under. RN models only")
+    p.add_argument("--clip-steer", default=None, metavar="VEC",
+                   help="steering vector from unicasso.engine.steer (text.pt / data.pt): a fixed "
+                        "unit direction added to the normalized TARGET embedding before the "
+                        "semantic cosine, so the render is asked for 'the target, but "
+                        "ascii-flavoured'. Acts on the fc/semantic term only (the one term in a "
+                        "space text and image share) -- pair with --clip-steer-weight. RN models only")
+    p.add_argument("--clip-steer-weight", type=float, default=0.5, metavar="LAMBDA",
+                   help="lambda in normalize(normalize(e_target) + lambda*delta). The cosine "
+                        "renormalizes, so the loss stays bounded and only its DIRECTION rotates: "
+                        "lambda=1 puts the steered target halfway between the true target and the "
+                        "pure steering direction. No effect without --clip-steer")
     p.add_argument("--clip-semantic-weight", type=float, default=0.1, help="weight on the CLIPasso SEMANTIC term (1 - cosine of the final CLS/fc embeddings); 0.1 = CLIPasso default; the geometric conv-layer L2 has weight 1")
     p.add_argument("--clip-model", default="RN101", help="open_clip model name (RN101=CLIPasso conv; ViT-B-16=CLIPascene-style global-attention ViT; convnext_base_w=LAION conv)")
     p.add_argument("--clip-pretrained", default="openai", help="open_clip pretrained tag; RN101/ViT-* use 'openai', convnext_base_w needs a LAION tag e.g. 'laion2b_s13b_b82k'")
@@ -1000,6 +1011,17 @@ def parse_args():
                         "the exploration/election phases without leaving the final soft render "
                         "noise-jittered. 1.0 = off")
     p.add_argument("--base-width", "--width", "--cols", type=int, default=60, help="grid width in chars (auto height)")
+    p.add_argument("--glyph-budget", type=int, default=0,
+                   help="size the grid by TOTAL CELLS instead of by column count: solve the "
+                        "width so GW x GH ~= this, at the image's own aspect. Fixed columns "
+                        "hold constant the thing that matters least (a display width) and let "
+                        "the actual resource swing with aspect -- at 60 columns a 3:4 portrait "
+                        "gets 2280 cells and a 16:9 frame gets 960, a 2.4x gap for the same "
+                        "label. 0 = off, use --base-width")
+    p.add_argument("--budget-max-width", type=int, default=100,
+                   help="(--glyph-budget) column ceiling, so a panoramic frame spends its "
+                        "budget on rows instead of running off the terminal. Set 80 to keep "
+                        "every render inside a classic terminal width")
     p.add_argument("--row-gap", type=int, default=0)
     # Banning is inference-time: drop these glyphs from the codebook so snapping never picks
     # them. No retrain needed (the VAE still embeds all glyphs; we just exclude them).
@@ -1058,6 +1080,20 @@ def parse_args():
     p.add_argument("--color-fit-detach", action="store_true",
                    help="(--color-fit) colors follow the shape but pass NO gradient back through "
                         "the fit -- the ablation for whether the fit's gradient path does work")
+    p.add_argument("--color-source", default="blend", choices=["fit", "cluster", "blend"],
+                   help="(--color-fit) shipped fg/bg: 'fit' = pure closed-form MSE at the ink, "
+                        "'cluster' = the decomposition's own two cluster colors (glyph-independent, "
+                        "preserves each cell's bimodal contrast), 'blend' (default) = "
+                        "--color-cluster-alpha mix of both -- punchier than the plain fit without "
+                        "losing the rendered mean")
+    p.add_argument("--color-cluster-alpha", type=float, default=0.5,
+                   help="cluster share of the shipped colors under --color-source blend")
+    p.add_argument("--color-bg-dist-pow", type=float, default=1.0,
+                   help="bg-fit votes weighted by (pixel distance to the glyph's ink)^pow: "
+                        "stroke-fringe pixels (antialiasing/misalignment contamination) barely "
+                        "count, so the background color stops smearing across strokes. 0 = off "
+                        "(plain fit). Glyph-dependent: applied per slot in-loop and at the placed "
+                        "glyph at emission")
     p.add_argument("--color-contrast-learn", action=argparse.BooleanOptionalAction, default=True,
                    help="(--color-fit, DEFAULT ON) let CLIP learn a PER-CELL contrast multiplier k on top of "
                         "the fitted colors, over the last --color-contrast-iters steps. k=1 is "
@@ -1125,6 +1161,35 @@ def parse_args():
                    help="save a hard-render snapshot of the CURRENT optimization state every N "
                         "iterations to <output stem>_progress/ (0 = off). Cheap: one glyph "
                         "assembly per snapshot, no extra optimization work")
+    # Early stop: once the run has stopped moving, the remaining iterations cannot change
+    # the emitted grid, so they are pure cost. TWO independent signals must agree, because
+    # either alone is fooled: the hard snap can sit still through a soft phase that is
+    # still re-arbitrating underneath it, and the diversity term can flatten while the
+    # argmax is still flipping between near-tied slots.
+    p.add_argument("--early-stop-patience", type=int, default=6,
+                   help="stop once BOTH (a) the hard snap has been unchanged for this many "
+                        "consecutive checks and (b) the blend-diversity term has plateaued "
+                        "(0 = off, the default). A check runs every --early-stop-every iters, "
+                        "so patience x every = the stable window required. Try 6 with "
+                        "--early-stop-every 50 (a 300-iter stable snap)")
+    p.add_argument("--early-stop-every", type=int, default=50,
+                   help="iters between hard-snap stability checks (one cdist; negligible)")
+    p.add_argument("--early-stop-tol", type=float, default=0.0,
+                   help="fraction of cells allowed to change and still count as stable "
+                        "(0 = exact). Small values ride out a single late churning cell; "
+                        "0.001 of a 2200-cell grid is ~2 cells")
+    p.add_argument("--early-stop-div-window", type=int, default=50,
+                   help="window (iters) for the diversity-plateau test: the mean of the last "
+                        "window is compared with the mean of the window before it. 0 = drop "
+                        "the diversity condition and stop on snap stability alone")
+    p.add_argument("--early-stop-div-tol", type=float, default=0.02,
+                   help="plateau threshold: diversity counts as flat when it fell by less "
+                        "than this FRACTION of its own level over one window. 0.02 = still "
+                        "shedding 2%% of the blend variance per window still counts as moving")
+    p.add_argument("--early-stop-frac", type=float, default=0.86,
+                   help="floor: never stop before this fraction of the schedule, whatever the "
+                        "signals say. A guard against a quiet warm-up being read as convergence, "
+                        "not a convergence estimate -- the two signals decide")
     p.add_argument("--output", "--out", default=None,
                    help="output PNG (default: <input stem>_ascii.png in the current dir)")
     p.add_argument("--output-text", default=None,
@@ -1166,6 +1231,10 @@ def parse_args():
         p.error("--orient-weight needs --row-gap 0 (per-cell pooling assumes a contiguous grid)")
     if args.mode in ("pool", "swarm") and args.row_gap > 0:
         p.error(f"--mode {args.mode} needs --row-gap 0 (per-cell gradient slicing assumes a contiguous grid)")
+    if args.clip_steer and args.clip_semantic_weight <= 0:
+        p.error("--clip-steer acts on the SEMANTIC term only; --clip-semantic-weight 0 makes it a no-op")
+    if args.clip_steer and args.clip_steer_weight == 0:
+        p.error("--clip-steer with --clip-steer-weight 0 is the unsteered baseline; drop --clip-steer to say so")
     return args
 
 
@@ -1233,7 +1302,20 @@ def main():
     # Grid from image aspect (reuses the rasterizer helpers).
     img_w, img_h = train.native_size(args.input_image)
     GW = args.base_width
+    if args.glyph_budget > 0:
+        # Constant glyph budget. With GH chosen to preserve aspect,
+        #   GH = GW * CW * img_h / ((CH + gap) * img_w)   =>   M = GW^2 * CW * img_h / ((CH+gap) * img_w)
+        # so the width that spends exactly the budget is
+        #   GW = sqrt( M * (CH + gap) * img_w / (CW * img_h) ).
+        GW = int(round(math.sqrt(args.glyph_budget * (CH + args.row_gap) * img_w
+                                 / max(CW * img_h, 1e-9))))
+        GW = max(8, min(GW, args.budget_max_width))
     GH = train.grid_height_for_aspect(img_w, img_h, GW, CW, CH, args.row_gap)
+    if args.glyph_budget > 0:
+        print(f"glyph budget {args.glyph_budget}: aspect {img_w / max(img_h, 1):.3f} -> "
+              f"{GW}x{GH} = {GW * GH} cells"
+              + (f" (width clamped to --budget-max-width {args.budget_max_width})"
+                 if GW == args.budget_max_width else ""))
     train.GRID_WIDTH, train.GRID_HEIGHT = GW, GH
     train.IMAGE_WIDTH = CW * GW
     train.IMAGE_HEIGHT = CH * GH + args.row_gap * (GH - 1)
@@ -1706,6 +1788,15 @@ def main():
                                               if args.color_fit_min_contrast is None
                                               else args.color_fit_min_contrast)
                         swarm.color_fit_detach = args.color_fit_detach
+                        if args.color_bg_dist_pow > 0:
+                            from unicasso.engine.color import glyph_bg_dist
+                            swarm.color_bg_dist = glyph_bg_dist(1.0 - bm_flat, CH, CW)
+                            swarm.color_bg_dist_pow = args.color_bg_dist_pow
+                        if args.color_source != "fit" and color_dec is not None:
+                            swarm.cluster_fg = color_dec["fg"].detach()
+                            swarm.cluster_bg = color_dec["bg"].detach()
+                            swarm.cluster_alpha = (1.0 if args.color_source == "cluster"
+                                                   else args.color_cluster_alpha)
                         if args.color_contrast_learn:
                             swarm.k_contrast_max = args.color_contrast_max
                             param_groups.append({"params": [swarm.k_contrast],
@@ -1715,7 +1806,11 @@ def main():
                                   f"tv {args.color_contrast_tv}, max {args.color_contrast_max})")
                         print("color: --color-fit -> fg/bg = closed-form MSE optimum every step "
                               f"(min-contrast {swarm.color_fit_mc:g}"
-                              + (", detached" if args.color_fit_detach else "") + ")")
+                              + (", detached" if args.color_fit_detach else "")
+                              + (f", bg-dist pow {args.color_bg_dist_pow:g}"
+                                 if swarm.color_bg_dist is not None else "")
+                              + (f", cluster alpha {swarm.cluster_alpha:g}"
+                                 if swarm.cluster_fg is not None else "") + ")")
                     else:
                         _clr = args.lr if args.color_lr is None else args.color_lr
                         param_groups.append({"params": [swarm.fg, swarm.bg], "lr": _clr})
@@ -1822,7 +1917,8 @@ def main():
                                          vit_layers=vit_layers, vit_drop_cls=args.clip_vit_drop_cls,
                                          fp16=args.clip_fp16, adapter=args.clip_adapter,
                                          batch_aug=args.clip_batch_aug,
-                                         reg_frac=args.clip_reg_frac, cell_h=CH, cell_w=CW, microbatch=args.clip_microbatch)
+                                         reg_frac=args.clip_reg_frac, cell_h=CH, cell_w=CW, microbatch=args.clip_microbatch,
+                                         steer=args.clip_steer, steer_weight=args.clip_steer_weight)
             if args.clip_reg_frac > 0:
                 print(f"  crop registration ON: target crops nudged up to +/-{args.clip_reg_frac} cell "
                       f"({int(round(args.clip_reg_frac * CW))}x{int(round(args.clip_reg_frac * CH))}px)")
@@ -1862,18 +1958,18 @@ def main():
                 (pool if pool is not None else swarm).affinity_partner = part
                 print(f"{args.mode} affinity channel: partners for {int((part >= 0).sum())}/{M} cells")
         except Exception as e:
-            # DINOv3 (lvd1689m) is a GATED HuggingFace repo, and the canonical recipe
-            # turns affinity on by default -- so on a fresh install without a licence
-            # acceptance + `huggingface-cli login` this is the FIRST thing that fails,
-            # and it would brick the advertised one-line quickstart. Fail loudly, drop
-            # the non-local term, and finish the render: everything else is unchanged.
+            # The canonical recipe turns affinity on by default, so a failed DINOv3
+            # fetch is the FIRST thing that breaks on a fresh install and it would brick
+            # the advertised one-line quickstart. Fail loudly, drop the non-local term,
+            # and finish the render: everything else is unchanged.
             print("\n" + "!" * 78)
             print(f"AFFINITY DISABLED -- could not load DINOv3 ({args.dino_model})")
             print(f"  {type(e).__name__}: {e}")
-            print("  DINOv3 weights are gated. To enable the non-local affinity term:")
-            print("    1. accept the licence at "
-                  "https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m")
-            print("    2. huggingface-cli login")
+            print("  The timm weights normally download without a HuggingFace account,")
+            print("  so this is usually network or a stale timm. Try:")
+            print("    pip install -U timm     # older versions lack the dinov3 entries")
+            print("  Meta's own facebook/dinov3-* repos ARE licence-gated; if you pointed")
+            print("  --dino-model at one of those, accept it there and huggingface-cli login.")
             print("  Continuing WITHOUT affinity. Pass --affinity-weight-end 0 to silence this.")
             print("!" * 78 + "\n")
             args.affinity_weight = 0.0
@@ -1902,7 +1998,7 @@ def main():
             i = snap_indices()
             k1 = swarm.W.data.masked_fill(swarm.free, float("-inf")).argmax(1)
             if getattr(swarm, "color_fit", False):
-                fgv, bgv = swarm.fit_emit_colors(1.0 - bm_flat[i])
+                fgv, bgv = swarm.fit_emit_colors(1.0 - bm_flat[i], gidx=i)
             else:
                 fgv, bgv = swarm._colors()
                 fgv = fgv[swarm._ar, k1].clamp(0, 1)
@@ -2028,7 +2124,7 @@ def main():
         image, not of a render nothing could produce."""
         if probe_color:
             ink_ = 1.0 - bm_flat[gidx]                                   # (M,P), 1 = glyph ink
-            fgp, bgp = swarm.fit_emit_colors(ink_)
+            fgp, bgp = swarm.fit_emit_colors(ink_, gidx=gidx)
             cc = bgp[:, None, :] + (fgp - bgp)[:, None, :] * ink_[:, :, None]
             return assemble_rgb(cc.view(1, GH, GW, CH, CW, 3), GH, GW, CH, CW,
                                 args.row_gap, IMG_H, IMG_W)[0]
@@ -2065,6 +2161,42 @@ def main():
         seg_ = args.swarm_w_temp_end_frac * sched_iters / args.swarm_w_temp_cycles
         sw_seams = {int(round(k * seg_)) for k in range(1, args.swarm_w_temp_cycles)}
         print(f"swarm elite purge at reheat seams: iters {sorted(sw_seams)}")
+    # ---- early stop (see --early-stop-patience) -------------------------------------
+    # Two signals, ANDed, because each alone has a blind spot: the hard SNAP can sit still
+    # through a soft phase that is still re-arbitrating underneath it (the argmax has not
+    # moved, but the weights behind it have), and the DIVERSITY term can flatten while the
+    # argmax still flips between near-tied slots. Together: nothing is moving, above or
+    # below the discretization. --early-stop-frac is only a floor against reading a quiet
+    # warm-up as convergence.
+    es_on = args.early_stop_patience > 0
+    es_floor, es_tol = int(args.early_stop_frac * sched_iters), int(round(args.early_stop_tol * M))
+    es_prev, es_stable, es_break = None, 0, False
+    es_div_hist, es_div_flat = [], True
+    # COLOUR REFINE PHASE. Placement (glyph choice) and colour (per-cell contrast k) converge
+    # on different signals: k never moves the snap, so the snap/diversity plateau below cannot
+    # see the k-phase working. So instead of disabling early-stop under --color-contrast-learn,
+    # the placement plateau ARMS a fixed colour-contrast budget: k learning is forced on, and
+    # the run then goes exactly --color-contrast-iters more steps before stopping (the same
+    # window it would have gotten at the run's tail, just started as soon as placement is done
+    # rather than at a fixed offset). es_refine_start = the iter it was armed (None = placement).
+    es_refine = args.color and args.color_contrast_learn and args.color_contrast_iters > 0
+    es_refine_start = None
+    # the diversity term's own activation condition, evaluated here rather than in the loop
+    es_div_avail = (pool_mode or swarm_mode) and (
+        args.pool_diversity_weight > 0 or (args.pool_diversity_weight_end or 0) > 0)
+    es_div_on = es_on and args.early_stop_div_window > 0 and es_div_avail
+    if es_on:
+        if args.early_stop_div_window > 0 and not es_div_avail:
+            print("early-stop: diversity term inactive, so the plateau condition is dropped "
+                  "-- stopping on hard-snap stability alone")
+    if es_on:
+        print(f"early stop: floor iter {es_floor} ({args.early_stop_frac:.2f} of schedule), "
+              f"then stop when the snap is unchanged for {args.early_stop_patience} checks "
+              f"x {args.early_stop_every} iters "
+              f"({args.early_stop_patience * args.early_stop_every} iters"
+              + (f", tolerance {es_tol} cells" if es_tol else ", exact") + ")"
+              + (f" AND diversity has fallen < {args.early_stop_div_tol:.0%} over "
+                 f"{args.early_stop_div_window} iters" if es_div_on else ""))
     sw_blank_ids = (torch.tensor([i for i, c in enumerate(chars) if c.isspace() or c == "\xa0"],
                                  device=device) if swarm_mode else None)
     sw_blank_streak = (torch.zeros(M, dtype=torch.long, device=device) if swarm_mode else None)
@@ -2186,7 +2318,8 @@ def main():
                 tau_c, tau_w_c = kt, wt
             if args.color_contrast_learn and getattr(swarm, "color_fit", False):
                 swarm.k_contrast_on = (args.color_contrast_iters <= 0
-                                       or it >= sched_iters - args.color_contrast_iters)
+                                       or it >= sched_iters - args.color_contrast_iters
+                                       or es_refine_start is not None)   # armed early by plateau
             gate = None
             if g_emp is not None and args.empty_noise_scale < 1.0:
                 gate = 1.0 - g_emp * (1.0 - args.empty_noise_scale)          # empties audition quietly
@@ -2922,6 +3055,42 @@ def main():
                     prec["swap_out"].extend(s_out.cpu().tolist())
                     prec["swap_ch"].extend(s_ch.cpu().tolist())
 
+        # Early-stop probe. Measured HERE (after opt.step + the nomination round, so the
+        # snap is this iteration's final state) but the loop is broken at the BOTTOM, so
+        # the curve/progress/record blocks still capture the iteration we stop on.
+        if es_div_on:
+            es_div_hist.append(float(div))          # already synced for the postfix below
+        # PLACEMENT-phase plateau detection -- only runs until refine is armed (k does not
+        # move the snap, so this signal is meaningless during the colour phase).
+        if es_on and es_refine_start is None and it >= es_floor \
+                and it % args.early_stop_every == 0:
+            with torch.no_grad():
+                es_now = snap_indices()
+            if es_prev is not None:
+                es_stable = es_stable + 1 if int((es_now != es_prev).sum()) <= es_tol else 0
+            es_prev = es_now
+            if es_div_on:
+                # plateau = the last window shed less than div-tol of its own level versus
+                # the window before it. Relative, so it reads the same at any diversity
+                # weight; a run still committing sheds far more than a few percent.
+                wdv = args.early_stop_div_window
+                if len(es_div_hist) >= 2 * wdv:
+                    cur_d = sum(es_div_hist[-wdv:]) / wdv
+                    prev_d = sum(es_div_hist[-2 * wdv:-wdv]) / wdv
+                    es_div_flat = (prev_d - cur_d) <= args.early_stop_div_tol * max(prev_d, 1e-12)
+                else:
+                    es_div_flat = False
+            if es_stable >= args.early_stop_patience and es_div_flat:
+                if es_refine:
+                    es_refine_start = it     # placement done -> arm the colour-contrast budget
+                    print(f"\nearly stop: placement converged at iter {it}; arming "
+                          f"colour-contrast refinement for {args.color_contrast_iters} iters")
+                else:
+                    es_break = True
+        # REFINE phase: once armed, run exactly --color-contrast-iters more, then stop
+        if es_refine_start is not None and it >= es_refine_start + args.color_contrast_iters:
+            es_break = True
+
         if diag_on:
             _gsrc = img_rgb if img_rgb is not None else img
             g_clip = _gsrc.grad[0] - rw * recon_mult * g_recon_unit
@@ -3070,6 +3239,19 @@ def main():
                         (swarm.g_ema.mean(1) if swarm.g_ema is not None
                          else torch.zeros(M, device=device)).cpu().numpy().astype(np.float32))
 
+        if es_break:
+            skipped_es = args.iters - it - 1
+            reason = (f"colour-contrast budget of {args.color_contrast_iters} iters done"
+                      if es_refine_start is not None
+                      else (f"hard snap unchanged for {es_stable} checks "
+                            f"({es_stable * args.early_stop_every} iters)"
+                            + (f" within {es_tol} cells" if es_tol else "")
+                            + (f" and diversity flat over {args.early_stop_div_window} iters"
+                               if es_div_on else "")))
+            print(f"\nearly stop at iter {it}/{args.iters}: {reason} -- skipping {skipped_es} "
+                  f"remaining ({100 * skipped_es / max(1, args.iters):.0f}% of the run)")
+            break
+
     # --- final measured runner-up election (swarm): each open cell's 2nd-best slot finalist is
     # hard-probed in the FINAL context (all neighbors settled, so mid-run rejections can become
     # clear accepts). Slot-finalists only; no open-codebook search.
@@ -3188,7 +3370,7 @@ def main():
             k1e = swarm.W.data.masked_fill(swarm.free, float("-inf")).argmax(1)
             if getattr(swarm, "color_fit", False):
                 # refit at the PLACED glyph, matching what the loop optimized
-                fge, bge = swarm.fit_emit_colors(1.0 - bm_flat[idx.view(M)])
+                fge, bge = swarm.fit_emit_colors(1.0 - bm_flat[idx.view(M)], gidx=idx.view(M))
             else:
                 fge, bge = swarm._colors()
                 fge = fge[swarm._ar, k1e].clamp(0, 1)      # (M,3)

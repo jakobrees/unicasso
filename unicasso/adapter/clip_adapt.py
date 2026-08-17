@@ -47,7 +47,10 @@ from unicasso.engine.clip_adapter import (inject_adapters, adapter_parameters, a
                            set_enabled, save_adapters)
 
 EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
-VARIANT_RE = re.compile(r"_(w\d+(_clip05)?)$")
+# Variant suffixes: _w<cols> (column-sized, the original corpus) and _b<cells>
+# (glyph-budget-sized, see batch_asciify.VARIANTS). Both strip to the same parent, so a
+# corpus may mix the two and every variant of one image still lands on one side of a split.
+VARIANT_RE = re.compile(r"_([wb]\d+(_clip05)?)$")
 from unicasso.substrate.glyphs import repo_path
 VAE_DEFAULT = repo_path("weights/vae_sfmono/model.pt")
 

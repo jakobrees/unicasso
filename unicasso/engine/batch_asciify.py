@@ -3,12 +3,14 @@
     GLYPHVAE_FONT=sfmono python -m unicasso.engine.batch_asciify /path/to/images \
         --out /path/to/results [--defer "folderA,folderB"] [--dry-run]
 
-Per image, two variants (editable in BASE_ARGS/VARIANTS below):
-    <stem>_w60          base-width 60
-    <stem>_w55          base-width 55
+Per image, two variants (editable in BASE_ARGS/VARIANTS below), sized by GLYPH BUDGET
+rather than column count so the grid is comparable across aspect ratios:
+    <stem>_b2000        ~2000 cells
+    <stem>_b980         ~980 cells
 
-Each variant writes txt/png/gif/loss(+npz)/pool-record/log next to each other in the
-mirrored directory. RESUME-SAFE: a variant whose .txt already exists is skipped, so you
+Each variant writes txt/png/loss(+npz)/pool-record/log -- beside each other by default,
+or under one subdirectory per artifact type with --layout split. A GIF is written only
+with --anim. RESUME-SAFE: a variant whose .txt already exists is skipped, so you
 can ctrl-C anytime and re-run to continue. A failed variant is logged and the batch
 moves on (summary at the end). --defer takes folder names (path-component match) whose
 images are queued LAST.
@@ -19,6 +21,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from unicasso.substrate import glyphs as G
@@ -27,46 +30,28 @@ EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 # ---- canonical configuration -- edit here, not below -----------------------------
 VAE = G.repo_path("weights/vae_dejavu/model.pt")   # default VAE checkpoint
-ITERS = "5000"
-W_DECAY = "0.02"          # swarm slot-weight decay
-JOIN_EVERY = "2"          # join-channel cadence (set 1 to run join every round)
-CLIP_CROP = ("0.4", "0.9")
 
-# Everything not listed here comes from the canonical recipe (the asciify defaults,
-# see unicasso/engine/canonical_recipe.args). This list is ONLY where the corpus
-# batch deliberately departs from it. Verified equivalent to the old fully-explicit
-# list by test_batch_args.py -- run that after editing.
+# The corpus renders the CANONICAL RECIPE: everything not listed here comes from the
+# asciify defaults (unicasso/engine/canonical_recipe.args) and the active kit profile.
+# This list is ONLY the batch's own additions -- corpus-scale concerns that have no
+# meaning for a single render. Anything else added here is a departure from the shipped
+# configuration and makes the dataset document something other than what users get.
 BASE_ARGS = [
-    "--vae-ckpt", VAE, "--iters", ITERS,
-    "--swarm-w-decay", W_DECAY,
-    # longer, gentler weight-temperature programme than the single-image recipe
-    "--swarm-w-temp-end", "0.03", "--swarm-w-temp-cycles", "3",
-    "--swarm-w-temp-cycle-decay", "0.75",
-    "--swarm-epilogue-frac", "0.15",
-    # the batch keeps the pixel-fit latent nudge; the single-image recipe has it off
-    "--pixel-nudge-weight", "0.2", "--pixel-nudge-weight-end", "0.01",
-    "--pixel-nudge-weight-schedule", "cosine", "--pixel-nudge-weight-end-frac", "0.6",
-    # coordinate prior + join shaping: pinned here rather than taken from the kit
-    # profile, so a batch reproduces identically whichever kit it runs under
-    "--coord-weight-end", "0.02", "--coord-weight-end-frac", "0.25",
-    "--pool-join-coord-sigma", "0.2", "--pool-join-every", JOIN_EVERY,
-    # cheaper probing: the batch trades measurement depth for throughput across
-    # many images. probe-rate/per-chan are PINNED because the canonical recipe
-    # raised them (0 -> 1, 1 -> 2) and inheriting that would silently change
-    # every batch render.
-    "--pool-probe-rate", "0", "--pool-probe-per-chan", "1",
-    "--pool-probe-batches", "3", "--pool-probe-spacing", "11",
-    "--pool-diversity-weight", "1e-3", "--pool-diversity-weight-end", "1e-3",
-    "--pool-diversity-weight-start-frac", "0.2",
-    "--knn-temp-end", "0.08",
-    "--clip-dense-weight", "0.3",
-    # anti-confetti stack: a slightly harder input white-point than the default 0.9
-    "--target-white", "0.93",
-    "--anim-interval", "10",
+    "--vae-ckpt", VAE,
+    # per-slot trajectories at the default 25-iter resolution run ~26 MB/run; 100 is
+    # ample for aggregate churn statistics, and the handful of runs that feed a
+    # trajectory figure get their own high-resolution re-run
+    "--pool-record-interval", "100",
 ]
+# Grid sizing by TOTAL CELLS rather than column count. Fixed columns hold a display
+# convention constant and let the actual resource swing with aspect: at 60 columns a 3:4
+# portrait gets 2280 cells and a 16:9 frame 960 -- a 2.4x gap under one label, on a corpus
+# that is ~59% landscape. Two tiers, ~2:1 in glyphs, so a piece is re-resolved rather than
+# downsampled between them.
+BUDGET_LARGE, BUDGET_SMALL = "2000", "980"
 VARIANTS = [
-    ("w60", ["--base-width", "60", "--clip-crop-scale", *CLIP_CROP]),
-    ("w55", ["--base-width", "55", "--clip-crop-scale", *CLIP_CROP]),
+    ("b2000", ["--glyph-budget", BUDGET_LARGE]),
+    ("b980", ["--glyph-budget", BUDGET_SMALL]),
 ]
 # -----------------------------------------------------------------------------------
 
@@ -91,6 +76,31 @@ def main():
                          "outputs (any *_<stem>_*.txt), skip its not-yet-done variants. Lets "
                          "you add a new variant only to images that lack a full set, without "
                          "re-covering images already done under an earlier variant list.")
+    ap.add_argument("--layout", choices=["flat", "split"], default="flat",
+                    help="flat = every artifact beside its siblings under --out (the "
+                         "original layout). split = one subdirectory per artifact type "
+                         "(txts/ renders/ curves/ records/ logs/), which keeps the raw "
+                         "data separable from the renders and lets the adapter read "
+                         "--txt-root <out>/txts directly")
+    ap.add_argument("--strip-suffix", default="",
+                    help="drop this suffix from each input stem when naming outputs, e.g. "
+                         "'_line' turns 00001_line.png into 00001_b2000.txt. Keeps the output "
+                         "id identical to the corpus manifest id, so a grid joins to its "
+                         "provenance without string surgery; the adapter still locates the "
+                         "parent image, since it already tries both <stem> and <stem>_line")
+    ap.add_argument("--anim", action="store_true",
+                    help="also write an optimisation GIF per run. OFF by default for "
+                         "batches: frames are held in memory until the run ends, so at "
+                         "--anim-interval 10 over a few thousand iters that is hundreds "
+                         "of MB per concurrent job")
+    ap.add_argument("--stagger", type=float, default=8.0,
+                    help="MINIMUM seconds between ANY two worker cold-starts, enforced for the "
+                         "whole run (not just the opening wave). Each cold start loads "
+                         "CLIP+DINO and builds affinity -- a memory spike that trips the MPS "
+                         "OOM reaper if several coincide. A global rate-limiter, because "
+                         "runtimes decorrelate over time and finish-clustering would otherwise "
+                         "restart the herd mid-run. Launches already spread wider than this pay "
+                         "nothing. 0 = no spacing")
     ap.add_argument("--extra-args", default="",
                     help="extra asciify flags appended to every run; USE THE = FORM since "
                          "the value starts with dashes: --extra-args='--clip-batch-aug "
@@ -120,26 +130,35 @@ def main():
     print(f"{len(imgs)} images ({n_def} deferred to the end){ex_tail}; "
           f"{len(imgs) * len(VARIANTS)} runs total")
 
+    # artifact-type -> directory. In split layout the raw data (grids, records, curve
+    # series) lives apart from the renders, so a figure can be re-made from the run
+    # without re-running it, and the adapter reads <out>/txts straight away.
+    def art(kind, stem, vname, ext):
+        d = os.path.join(args.out, kind) if args.layout == "split" else args.out
+        return os.path.join(d, f"{stem}_{vname}{ext}")
+
     jobs, done, skipped = [], 0, 0
     for _, img in imgs:
         rel = os.path.relpath(img, args.root)
         stem = os.path.splitext(rel)[0]
-        have = len(glob.glob(os.path.join(args.out, glob.escape(stem) + "_*.txt")))
+        if args.strip_suffix and stem.endswith(args.strip_suffix):
+            stem = stem[:-len(args.strip_suffix)]
+        tdir = os.path.join(args.out, "txts") if args.layout == "split" else args.out
+        have = len(glob.glob(os.path.join(tdir, glob.escape(stem) + "_*.txt")))
         enough = args.max_variants_per_image and have >= args.max_variants_per_image
         for vname, vargs in VARIANTS:
-            base = os.path.join(args.out, f"{stem}_{vname}")
-            if os.path.exists(base + ".txt"):
+            if os.path.exists(art("txts", stem, vname, ".txt")):
                 done += 1
                 continue
             if enough:                                    # already has a full variant set
                 skipped += 1
                 continue
-            jobs.append((img, base, vargs))
+            jobs.append((img, stem, vname, vargs))
     tail = f", {skipped} skipped (>= {args.max_variants_per_image} variants)" if skipped else ""
     print(f"{done} already done (resume), {len(jobs)} to run{tail}")
     if args.dry_run:
-        for img, base, _ in jobs:
-            print(f"  {img} -> {base}.*")
+        for img, stem, vname, _ in jobs:
+            print(f"  {img} -> {art('txts', stem, vname, '.txt')} (+ render/curve/record/log)")
         return
 
     extra = args.extra_args.split() if args.extra_args else []
@@ -158,25 +177,57 @@ def main():
             print("=" * 78)
     gpus = [g.strip() for g in args.gpus.split(",") if g.strip()]
     failures, done_n, lock = [], [0], threading.Lock()
+    launch_lock = threading.Lock()
+    next_slot = [0.0]   # monotonic time the next cold-start may begin (global spacing)
+    # Live workers per GPU. A static job_index % n_gpus assignment is balanced by COUNT but
+    # not over TIME: the two variants (b2000 heavy, b980 light) finish at different rates, so
+    # the live split drifts (observed 6/10 on 2 GPUs) and heavy jobs pile onto the fuller card
+    # until it OOMs. Assigning each starting worker to the LEAST-loaded GPU instead keeps the
+    # split within 1 of even at all times -- exactly n/2 per GPU at saturation.
+    gpu_load = [0] * len(gpus) if gpus else []
 
     def run_one(idx_job):
-        i, (img, base, vargs) = idx_job
-        os.makedirs(os.path.dirname(base) or ".", exist_ok=True)
+        i, (img, stem, vname, vargs) = idx_job
+        if args.stagger > 0:                     # global min-spacing between cold-starts
+            with launch_lock:
+                now = time.monotonic()
+                slot = max(now, next_slot[0])        # reserve the next free launch slot
+                next_slot[0] = slot + args.stagger
+            delay = slot - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+        out = {k: art(k, stem, vname, e) for k, e in
+               (("txts", ".txt"), ("renders", ".png"), ("curves", "_loss.png"),
+                ("records", "_pool.npz"), ("logs", ".log"), ("anims", ".gif"))}
+        for p in out.values():
+            os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
         cmd = [sys.executable, "-m", "unicasso.engine.asciify", img, *BASE_ARGS, *vargs, *extra,
-               "--output-text", base + ".txt", "--output", base + ".png",
-               "--anim", base + ".gif", "--loss-curve", base + "_loss.png",
-               "--pool-record", base + "_pool.npz"]
+               "--output-text", out["txts"], "--output", out["renders"],
+               "--loss-curve", out["curves"], "--pool-record", out["records"]]
+        if args.anim:
+            cmd += ["--anim", out["anims"]]
         env = dict(os.environ)
+        gsel = None
         if gpus:
-            env["CUDA_VISIBLE_DEVICES"] = gpus[i % len(gpus)]
-        with open(base + ".log", "w") as lf:
-            r = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, env=env)
+            # claim the least-loaded GPU for this worker's lifetime (ties -> lowest index).
+            # Chosen AFTER the stagger delay, so it reflects the true live load at launch.
+            with launch_lock:
+                gsel = min(range(len(gpus)), key=lambda g: gpu_load[g])
+                gpu_load[gsel] += 1
+            env["CUDA_VISIBLE_DEVICES"] = gpus[gsel]
+        try:
+            with open(out["logs"], "w") as lf:
+                r = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, env=env)
+        finally:
+            if gsel is not None:                 # release the GPU slot even if the run raised
+                with launch_lock:
+                    gpu_load[gsel] -= 1
         with lock:
             done_n[0] += 1
             tag = "ok" if r.returncode == 0 else f"FAILED exit {r.returncode}"
-            print(f"[{done_n[0]}/{len(jobs)}] {tag}  {base}", flush=True)
+            print(f"[{done_n[0]}/{len(jobs)}] {tag}  {stem}_{vname}", flush=True)
             if r.returncode != 0:
-                failures.append(base)
+                failures.append(f"{stem}_{vname}")
 
     with ThreadPoolExecutor(max_workers=max(args.jobs, 1)) as ex:
         list(ex.map(run_one, enumerate(jobs)))
