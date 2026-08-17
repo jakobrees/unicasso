@@ -47,6 +47,7 @@ def main():
                         "(pair with the CUDA MPS daemon, see docs/adapter.md)")
     p.add_argument("--limit", type=int, default=0,
                    help="stop after N NEW samples (0 = no limit; benchmarking)")
+    p.add_argument("--profile", default="dejavu")
     p.add_argument("--device", default=None)
     args = p.parse_args()
 
@@ -61,7 +62,7 @@ def main():
 
     from unicasso.adapter.corrupt import CorruptionSampler
     sampler = CorruptionSampler(G.repo_path("weights/vae_dejavu/model.pt"),
-                                device="cpu", profile="dejavu")
+                                device="cpu", profile=args.profile)
     ink_flat_d = (1.0 - sampler.bitmaps.cpu().float()) \
         .reshape(sampler.N, -1).to(device)
     bg_dist_all = glyph_bg_dist(ink_flat_d.cpu(), ch, cw).to(device)

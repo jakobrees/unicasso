@@ -61,6 +61,7 @@ def main():
     p.add_argument("--train-on-all", action="store_true",
                    help="RELEASE mode: train regions from every run (eval informational)")
     p.add_argument("--vae-ckpt", default="weights/vae_dejavu/model.pt")
+    p.add_argument("--profile", default="dejavu")
     p.add_argument("--name", default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None)
@@ -98,7 +99,7 @@ def main():
 
     from unicasso.adapter.corrupt import CorruptionSampler
     sampler = CorruptionSampler(G.repo_path(args.vae_ckpt), device="cpu",
-                                profile="dejavu")
+                                profile=args.profile)
     bm_white = sampler.bitmaps.cpu().float().reshape(sampler.N, -1).to(device)
     from unicasso.engine.clip_loss import CLIPPerceptualLoss
     clipper = CLIPPerceptualLoss(torch.device(device), model_name="RN101",

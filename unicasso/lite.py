@@ -34,8 +34,12 @@ from PIL import Image, ImageOps
 from unicasso.substrate import glyphs as G, raster
 
 K_BIAS = math.log(1.0 / 3.0)                  # k-head: 4*sigmoid(raw+K_BIAS), k(0)=1
-DEFAULT_WEIGHTS = {"color": "weights/lite/unicasso-lite-color.pt",
-                   "line": "weights/lite/unicasso-lite-line.pt"}
+DEFAULT_WEIGHTS = {
+    ("color", "dejavu"): "weights/lite/unicasso-lite-color.pt",
+    ("line", "dejavu"): "weights/lite/unicasso-lite-line.pt",
+    ("color", "sfmono"): "weights/lite/unicasso-lite-color-sfmono.pt",
+    ("line", "sfmono"): "weights/lite/unicasso-lite-line-sfmono.pt",
+}
 
 
 def _grid_windows(img, gh, gw, ch, cw, ph, pw, rows, cols, pad_val=0, centers=None):
@@ -94,19 +98,29 @@ class LiteResult:
 
 
 class Lite:
-    def __init__(self, kind_or_path="color", device=None):
+    def __init__(self, kind_or_path="color", device=None, font=None):
+        """kind_or_path: "color" / "line" (resolved via `font`) or a ckpt path.
+        font: "dejavu" (default) or "sfmono"; falls back to $GLYPHVAE_FONT.
+        A checkpoint path ignores `font` -- its config names its own kit."""
         self.device = device or ("mps" if torch.backends.mps.is_available()
                                  else "cuda" if torch.cuda.is_available() else "cpu")
-        path = DEFAULT_WEIGHTS.get(kind_or_path, kind_or_path)
+        font = font or os.environ.get("GLYPHVAE_FONT", "dejavu")
+        path = DEFAULT_WEIGHTS.get((kind_or_path, font), kind_or_path)
         ck = torch.load(G.repo_path(path), map_location="cpu", weights_only=False)
         cfg = ck["config"]
         self.chars = ck["chars"]
         self.color = bool(cfg.get("color_model"))
         from unicasso.adapter.corrupt import CorruptionSampler
-        sampler = CorruptionSampler(G.repo_path("weights/vae_dejavu/model.pt"),
-                                    device="cpu", profile="dejavu")
+        profile = cfg.get("profile", "dejavu")
+        vae = {"dejavu": "weights/vae_dejavu/model.pt",
+               "sfmono": "weights/vae_sfmono/model.pt"}[profile]
+        self.align_blend = bool(cfg.get("align_blend"))
+        sampler = CorruptionSampler(G.repo_path(vae), device="cpu",
+                                    profile=profile)
         self.ch, self.cw = sampler.CH, sampler.CW
-        self.ph, self.pw = cfg.get("pad_h", 3), cfg.get("pad_w", 4)
+        pads = {"dejavu": (3, 4), "sfmono": (4, 3)}[profile]   # kit token margins
+        self.ph = cfg.get("pad_h", pads[0])
+        self.pw = cfg.get("pad_w", pads[1])
         self.rows, self.cols = 3, 5
         self.ink_flat = (1.0 - sampler.bitmaps.cpu().float()) \
             .reshape(sampler.N, -1).to(self.device)
@@ -247,8 +261,17 @@ class Lite:
         mask = self.ink_flat[g]
         C = dec["cell_rgb"].to(self.device)
         fg_f, bg_f = fit_fg_bg_distweighted(C, mask, self.bg_dist[g], pow_=1.0)
-        fg0 = 0.5 * dec["fg"].to(self.device) + 0.5 * fg_f
-        bg0 = 0.5 * dec["bg"].to(self.device) + 0.5 * bg_f
+        dfg = dec["fg"].to(self.device)
+        dbg = dec["bg"].to(self.device)
+        if self.align_blend:            # swap cluster colors where the cluster's
+            di = dec["ink"].to(self.device)   # ink map anti-aligns with the glyph
+            mm = mask - mask.mean(1, keepdim=True)
+            ii = di - di.mean(1, keepdim=True)
+            acorr = (mm * ii).sum(1) / (mm.norm(dim=1) * ii.norm(dim=1)).clamp_min(1e-6)
+            sw = (acorr < 0)[:, None]
+            dfg, dbg = torch.where(sw, dbg, dfg), torch.where(sw, dfg, dbg)
+        fg0 = 0.5 * dfg + 0.5 * fg_f
+        bg0 = 0.5 * dbg + 0.5 * bg_f
         mid = 0.5 * (fg0 + bg0)
         fg = (mid + khat[:, None] * (fg0 - mid)).clamp(0, 1)
         bg = (mid + khat[:, None] * (bg0 - mid)).clamp(0, 1)
@@ -275,8 +298,13 @@ def main():
                    help="use the line model: monochrome ASCII art, plain text, no color "
                         "(default: the color model, which emits 24-bit ANSI). Expects "
                         "LINE-ART input -- convert a photo first with unicasso.lineart")
+    p.add_argument("--font", default=None, choices=["dejavu", "sfmono"],
+                   help="which font kit's models to use (default: $GLYPHVAE_FONT or "
+                        "dejavu). sfmono renders with Apple's SF Mono from the system "
+                        "path -- macOS only unless you provide the font")
     p.add_argument("--weights", default=None,
-                   help="override the weights path (default: the shipped color/line model)")
+                   help="override the weights path (default: the shipped color/line "
+                        "model for --font)")
     p.add_argument("--out", default=None,
                    help="write the render here instead of stdout (stdout is clean ANSI/text, "
                         "safe to pipe or cat)")
@@ -302,7 +330,7 @@ def main():
     import contextlib
     with contextlib.redirect_stdout(sys.stderr):     # loader banners off stdout
         lite = Lite(args.weights or ("line" if args.line else "color"),
-                    device=args.device)
+                    device=args.device, font=args.font)
     width = args.width
     if width <= 0:                                    # 0 = fill the terminal when on a screen
         import shutil

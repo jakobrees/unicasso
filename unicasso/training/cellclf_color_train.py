@@ -29,6 +29,7 @@ import glob
 import json
 import math
 import os
+import re
 import time
 
 import numpy as np
@@ -82,6 +83,35 @@ def token_maps(gh, gw, rows, cols):
     return np.where(valid, yy * gw + xx, 0).astype(np.int64), valid
 
 
+ANSI_RE = re.compile(r"\x1b\[([0-9;]*)m")
+
+
+def parse_ans(path):
+    """.ans -> rows of (char, fg_rgb, bg_rgb); rows padded to equal width."""
+    txt = open(path, encoding="utf-8").read()
+    rows = []
+    for line in txt.split("\n"):
+        if not line.strip("\x1b[0m \t"):
+            continue
+        cells, fg, bg, i = [], (255, 255, 255), (0, 0, 0), 0
+        while i < len(line):
+            m = ANSI_RE.match(line, i)
+            if m:
+                q = m.group(1).split(";")
+                if len(q) >= 5 and q[0] == "38" and q[1] == "2":
+                    fg = tuple(int(v) for v in q[2:5])
+                elif len(q) >= 5 and q[0] == "48" and q[1] == "2":
+                    bg = tuple(int(v) for v in q[2:5])
+                i = m.end()
+            else:
+                cells.append((line[i], fg, bg))
+                i += 1
+        if cells:
+            rows.append(cells)
+    gw = max(len(r) for r in rows)
+    return [r + [(" ", (0, 0, 0), (0, 0, 0))] * (gw - len(r)) for r in rows]
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -129,6 +159,33 @@ def main():
     p.add_argument("--mode-token", action="store_true",
                    help="add the lineart/photo task-token embedding (v1 measured it "
                         "dead -- norm 0.024 vs token norm ~30 -- so default off)")
+    p.add_argument("--profile", default="dejavu",
+                   help="font kit profile; must match --cache and --vae-ckpt")
+    p.add_argument("--align-blend", action="store_true",
+                   help="alignment-aware blend: swap decompose's cluster fg/bg in cells "
+                        "where its ink map anti-correlates with the placed glyph's mask "
+                        "(fixes contrast cancellation at speculars). Stamped into the "
+                        "checkpoint cfg so lite deploys identically")
+    p.add_argument("--ans-targets", default="",
+                   help="dir of full-run color targets: <name>_recolored.ans + "
+                        "<name>_k_newbase.npy pairs. PERMANENT training arm (never "
+                        "phased out): exact glyph CE + displacement-weighted k regression")
+    p.add_argument("--ans-photo-dirs", default="data/color_images_plus",
+                   help="comma-separated dirs holding the targets' parent photos")
+    p.add_argument("--ans-holdout", default="leather,moto helmet",
+                   help="substring list: matching target pieces are excluded (render gate)")
+    p.add_argument("--target-frac", type=float, default=0.25,
+                   help="fraction of steps drawn as ans-target steps")
+    p.add_argument("--k-balance", action="store_true",
+                   help="entropy-equalize the k supervision: weight each target cell "
+                        "by 1/p(k) (smoothed histogram over ALL target cells) so every "
+                        "k regime carries equal gradient mass, GATED by displacement "
+                        "min(disp/0.05, 1) so rare-k-but-invisible noise cells stay muted")
+    p.add_argument("--k-balance-cap", type=float, default=10.0)
+    p.add_argument("--k-dev-weight", type=float, default=1.0,
+                   help="k-loss weight scale ~ |k-1|*||base deviation|| (displacement): "
+                        "emphasizes cells whose contrast intent is large in COLOR units, "
+                        "ignoring huge-k-on-tiny-deviation noise cells")
     p.add_argument("--photo-color-aux", type=float, default=0.0,
                    help="MSE weight tying col_head to the closed-form blend fg/bg on "
                         "photo steps (unscaled by lambda; 0 = the shipped v1 recipe)")
@@ -222,11 +279,13 @@ def main():
         nn.init.zeros_(model.col_head.weight); nn.init.zeros_(model.col_head.bias)
     cfg = dict(cfg, color_model=True,
                feat_dim=0 if scratch else cfg.get("feat_dim", FEAT_DIM) or FEAT_DIM,
-               arch=args.arch)
+               arch=args.arch, profile=args.profile,
+               align_blend=args.align_blend,
+               pad_h=meta["pad_h"], pad_w=meta["pad_w"])
 
     from unicasso.adapter.corrupt import CorruptionSampler
     sampler = CorruptionSampler(G.repo_path(args.vae_ckpt), device="cpu",
-                                profile="dejavu")
+                                profile=args.profile)
     ink_flat = (1.0 - sampler.bitmaps.cpu().float()).reshape(sampler.N, -1)
     ink_flat_d = ink_flat.to(device)
     bm_white = (1.0 - ink_flat).to(device)
@@ -255,6 +314,84 @@ def main():
         print(f"  {len(ktarg)} k-target samples "
               f"(regression until step {args.k_refine_start}, refinement after)",
               flush=True)
+    ans_targets = []
+    if args.ans_targets:
+        pdirs = [G.repo_path(d) for d in args.ans_photo_dirs.split(",") if d]
+        hold = [s.strip() for s in args.ans_holdout.split(",") if s.strip()]
+        bg_dist_cpu = bg_dist_all.cpu()
+        for f in sorted(glob.glob(os.path.join(G.repo_path(args.ans_targets),
+                                               "*_recolored.ans"))):
+            base = os.path.basename(f)[:-len("_recolored.ans")]
+            if any(h in base for h in hold):
+                continue
+            kf = os.path.join(os.path.dirname(f), base + "_k_newbase.npy")
+            if not os.path.exists(kf):
+                continue
+            pid = re.sub(r"_w[0-9].*", "", base)
+            photo = next((q for d in pdirs
+                          for e in ("jpg", "jpeg", "png", "JPG", "JPEG", "PNG")
+                          for q in [os.path.join(d, f"{pid}.{e}")]
+                          if os.path.exists(q)), None)
+            if photo is None:
+                print(f"  [ansT] no parent for {base}, skipped", flush=True)
+                continue
+            rws = parse_ans(f)
+            gh_t, gw_t = len(rws), len(rws[0])
+            gt = torch.tensor([[cache.chars.index(c) if c in cache.chars
+                                else cache.space for c, _, _ in rr]
+                               for rr in rws]).long().view(-1)
+            with Image.open(photo) as im:      # extraction convention: no transpose
+                im = im.convert("RGB").resize((gw_t * cw, gh_t * ch), Image.LANCZOS)
+            rgb_t = torch.from_numpy(np.asarray(im, np.float32) / 255.0)
+            dec_t = decompose(rgb_t, gh_t, gw_t, ch, cw)
+            ink_t = np.clip((1.0 - nomination_target(dec_t).numpy()) * 255.0,
+                            0, 255).astype(np.uint8)
+            kf_t = torch.from_numpy(np.load(kf).astype(np.float32)).view(-1)
+            # displacement weight = |k-1| * ||aligned-base deviation||
+            mask_t = ink_flat[gt]
+            fg_ft, bg_ft = fit_fg_bg_distweighted(dec_t["cell_rgb"], mask_t,
+                                                  bg_dist_cpu[gt], pow_=1.0)
+            mm = mask_t - mask_t.mean(1, keepdim=True)
+            ii = dec_t["ink"] - dec_t["ink"].mean(1, keepdim=True)
+            acorr = (mm * ii).sum(1) / (mm.norm(dim=1) * ii.norm(dim=1)).clamp_min(1e-6)
+            sw = (acorr < 0)[:, None]
+            dfgt = torch.where(sw, dec_t["bg"], dec_t["fg"])
+            dbgt = torch.where(sw, dec_t["fg"], dec_t["bg"])
+            fgn = 0.5 * dfgt + 0.5 * fg_ft
+            bgn = 0.5 * dbgt + 0.5 * bg_ft
+            midn = 0.5 * (fgn + bgn)
+            dnorm = torch.cat([fgn - midn, bgn - midn], 1).norm(dim=1)
+            disp = (kf_t - 1.0).abs() * dnorm
+            wfld = 1.0 + args.k_dev_weight * (disp / 0.05).clamp(max=5.0)
+            ans_targets.append(dict(ink=ink_t, gh=gh_t, gw=gw_t,
+                                    feats=cell_feats(dec_t), glyphs=gt,
+                                    k=kf_t, w=wfld, disp=disp, name=base))
+        if ans_targets and args.k_balance:
+            # inverse-density equalizer x displacement gate, mean-normalized
+            allk = torch.cat([t["k"] for t in ans_targets]).numpy()
+            hist, edges = np.histogram(allk, bins=80, range=(0.0, 4.0))
+            g = np.exp(-0.5 * (np.arange(-6, 7) / 2.0) ** 2)
+            dens = np.convolve(hist / hist.sum(), g / g.sum(), mode="same")
+            dens = np.maximum(dens, 1e-4)
+            ws = []
+            for t in ans_targets:
+                b = np.clip(((t["k"].numpy() / 4.0) * 80).astype(int), 0, 79)
+                inv = torch.from_numpy((1.0 / dens[b]).astype(np.float32))
+                gate = (t["disp"] / 0.05).clamp(max=1.0)
+                t["w"] = (gate * inv).clamp_min(0.1)
+                ws.append(t["w"])
+            wm = torch.cat(ws).mean()
+            for t in ans_targets:
+                t["w"] = (t["w"] / wm).clamp(max=args.k_balance_cap)
+            aw = torch.cat([t["w"] for t in ans_targets])
+            kk = torch.cat([t["k"] for t in ans_targets])
+            for lo, hi in ((0.0, 0.5), (0.5, 1.5), (1.5, 2.5), (2.5, 4.01)):
+                m = (kk >= lo) & (kk < hi)
+                print(f"    k in [{lo},{hi}): {int(m.sum())} cells, "
+                      f"weight mass {float(aw[m].sum() / aw.sum()):.1%}", flush=True)
+        print(f"  {len(ans_targets)} ans-target pieces (PERMANENT arm, "
+              f"frac {args.target_frac}, holdout: {args.ans_holdout!r}, "
+              f"k-balance {args.k_balance})", flush=True)
     train_runs = [i for i, r in enumerate(cache.meta["runs"])
                   if args.train_on_all
                   or (r["split"] == "train" and r["parent"] not in viz_parents)]
@@ -374,8 +511,17 @@ def main():
         C = dec["cell_rgb"].to(device)
         gh_idx = g_or_st
         fg_f, bg_f = fit_fg_bg_distweighted(C, mask, bg_dist_all[gh_idx], pow_=1.0)
-        fg0 = 0.5 * dec["fg"].to(device) + 0.5 * fg_f
-        bg0 = 0.5 * dec["bg"].to(device) + 0.5 * bg_f
+        dfg_c, dbg_c = dec["fg"].to(device), dec["bg"].to(device)
+        if args.align_blend:
+            di = dec["ink"].to(device)
+            mm = mask - mask.mean(1, keepdim=True)
+            ii = di - di.mean(1, keepdim=True)
+            acorr = (mm * ii).sum(1) / (mm.norm(dim=1) * ii.norm(dim=1)).clamp_min(1e-6)
+            sw = (acorr < 0)[:, None]
+            dfg_c, dbg_c = (torch.where(sw, dbg_c, dfg_c),
+                            torch.where(sw, dfg_c, dbg_c))
+        fg0 = 0.5 * dfg_c + 0.5 * fg_f
+        bg0 = 0.5 * dbg_c + 0.5 * bg_f
         mid = 0.5 * (fg0 + bg0)
         fg = mid + khat[:, None] * (fg0 - mid)
         bg = mid + khat[:, None] * (bg0 - mid)
@@ -535,7 +681,29 @@ def main():
         r = rng.random()
         recal = (step % args.recal_every) < 2 or lam is None
         km = nb = -1.0
-        if r < args.photo_frac:
+        if ans_targets and rng.random() < args.target_frac:
+            kind = "ansT"
+            T = ans_targets[int(rng.integers(len(ans_targets)))]
+            xw = torch.from_numpy(grid_windows(T["ink"], T["gh"], T["gw"],
+                                               ch, cw, ph, pw)) \
+                .to(device).float().div_(255).unsqueeze(1)
+            ids_a, valid_a = token_maps(T["gh"], T["gw"], rows, cols)
+            ids_at = torch.from_numpy(ids_a).to(device)
+            valid_at = torch.from_numpy(valid_a).to(device)
+            feats_at = T["feats"].to(device)[ids_at] * valid_at[:, :, None].float()
+            logits, ct = forward_region(xw, feats_at, 1, None)
+            glab = T["glyphs"].to(device)
+            ya = torch.where(valid_at, glab[ids_at],
+                             torch.full_like(ids_at, -1))
+            ce_t = kernel_ce(logits, ya, kernel, ce_w)
+            khat = 4.0 * torch.sigmoid(model.k_head(ct)[:, 0] + K_BIAS)
+            lk_t = (T["w"].to(device) * (khat - T["k"].to(device)).pow(2)).mean()
+            loss = ce_t + lk_t
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            km = float(khat.mean())
+            nb = float((glab != cache.space).float().mean())
+        elif r < args.photo_frac:
             kind = "photo"
             if ktarg and (step + 1) <= args.k_refine_start:
                 kind = "kreg"

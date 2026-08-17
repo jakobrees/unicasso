@@ -840,6 +840,8 @@ def main():
                    help="comma-separated run stems rendered through the model at live updates")
     p.add_argument("--vae-ckpt", default="weights/vae_dejavu/model.pt",
                    help="for the glyph renderer used by --live-stems")
+    p.add_argument("--profile", default="dejavu",
+                   help="font kit profile (dejavu / sfmono); must match the cache + vae")
     p.add_argument("--ckpt-every", type=int, default=0,
                    help="save ckpt_step<N>.pt every N steps (early termination stays usable)")
     p.add_argument("--optim", default="adamw", choices=["adamw", "muon"],
@@ -876,6 +878,8 @@ def main():
     if (args.render_frac > 0 or args.clip_weight_target > 0) and not args.dense:
         p.error("--render-frac / --clip-weight-target require --dense")
     viz_parents = tuple(s for s in args.holdout_parents.split(",") if s)
+    args.pad_h, args.pad_w = meta["pad_h"], meta["pad_w"]   # into vars(args) ->
+    args.cell_h, args.cell_w = meta["cell_h"], meta["cell_w"]   # self-describing ckpts
     cache = CellCache(cache_dir, rows, cols,
                       meta["pad_h"], meta["pad_w"], meta["cell_h"], meta["cell_w"],
                       window_labels=args.dense, viz_parents=viz_parents)
@@ -914,7 +918,8 @@ def main():
     need_glyphs = args.render_frac > 0 or args.clip_weight_target > 0 or args.eval_clip
     if (args.live_every and live_stems) or need_glyphs:
         from unicasso.adapter.corrupt import CorruptionSampler
-        sampler = CorruptionSampler(G.repo_path(args.vae_ckpt), device="cpu", profile="dejavu")
+        sampler = CorruptionSampler(G.repo_path(args.vae_ckpt), device="cpu",
+                                    profile=args.profile)
 
     bm_white = ink_bm = clipper = synth = None
     clip_val_stems = []
