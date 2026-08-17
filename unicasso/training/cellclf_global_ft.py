@@ -103,7 +103,8 @@ def main():
     from unicasso.engine.clip_loss import CLIPPerceptualLoss
     clipper = CLIPPerceptualLoss(torch.device(device), model_name="RN101",
                                  pretrained="openai", n_aug=args.clip_aug,
-                                 crop_scale=tuple(args.crop_scale))
+                                 crop_scale=tuple(args.crop_scale),
+                                 batch_aug=(device == "cuda"))
     clip_val_stems = [r["stem"] for r in cache.meta["runs"]
                       if r["split"] == "val"][:4]
 

@@ -38,28 +38,41 @@ DEFAULT_WEIGHTS = {"color": "weights/lite/unicasso-lite-color.pt",
                    "line": "weights/lite/unicasso-lite-line.pt"}
 
 
-def _grid_windows(img, gh, gw, ch, cw, ph, pw, rows, cols, pad_val=0):
+def _grid_windows(img, gh, gw, ch, cw, ph, pw, rows, cols, pad_val=0, centers=None):
     py, px = (rows // 2) * ch + ph, (cols // 2) * cw + pw
     spec = ((py, py), (px, px)) + (((0, 0),) if img.ndim == 3 else ())
     pad = np.pad(img, spec, constant_values=pad_val)
     wh, ww = rows * ch + 2 * ph, cols * cw + 2 * pw
-    out = np.empty((gh * gw, wh, ww) + ((3,) if img.ndim == 3 else ()), img.dtype)
-    i = 0
-    for y in range(gh):
-        for x in range(gw):
-            t = py + y * ch - (rows // 2) * ch - ph
-            l = px + x * cw - (cols // 2) * cw - pw
-            out[i] = pad[t:t + wh, l:l + ww]; i += 1
+    if centers is None:
+        centers = [(y, x) for y in range(gh) for x in range(gw)]
+    out = np.empty((len(centers), wh, ww) + ((3,) if img.ndim == 3 else ()), img.dtype)
+    for i, (y, x) in enumerate(centers):
+        t = py + y * ch - (rows // 2) * ch - ph
+        l = px + x * cw - (cols // 2) * cw - pw
+        out[i] = pad[t:t + wh, l:l + ww]
     return out
 
 
-def _token_maps(gh, gw, rows, cols):
+def _token_maps(gh, gw, rows, cols, centers=None):
     offs = [(t // cols - rows // 2, t % cols - cols // 2) for t in range(rows * cols)]
-    ys, xs = np.mgrid[0:gh, 0:gw]
-    yy = ys.ravel()[:, None] + np.array([o[0] for o in offs])[None]
-    xx = xs.ravel()[:, None] + np.array([o[1] for o in offs])[None]
+    if centers is None:
+        ys, xs = np.mgrid[0:gh, 0:gw]
+        cy, cx = ys.ravel(), xs.ravel()
+    else:
+        c = np.asarray(centers)
+        cy, cx = c[:, 0], c[:, 1]
+    yy = cy[:, None] + np.array([o[0] for o in offs])[None]
+    xx = cx[:, None] + np.array([o[1] for o in offs])[None]
     valid = (yy >= 0) & (yy < gh) & (xx >= 0) & (xx < gw)
     return np.where(valid, yy * gw + xx, 0).astype(np.int64), valid
+
+
+def _strided_centers(gh, gw, s):
+    """Window centers at every s-th cell, last row/col always included; the 5x3
+    windows still cover every grid cell for s <= 3 (rows) / s <= 5 (cols)."""
+    ys = sorted(set(list(range(0, gh, s)) + [gh - 1]))
+    xs = sorted(set(list(range(0, gw, s)) + [gw - 1]))
+    return [(y, x) for y in ys for x in xs]
 
 
 def _binomial_kernel(rows, cols):
@@ -104,14 +117,17 @@ class Lite:
                              heads=cfg.get("heads", 4),
                              n_blocks=cfg.get("blocks", 3),
                              in_ch=cfg.get("in_ch", 1))
+        sd = ck["state_dict"]
         if self.color:
             dim = cfg.get("dim", 64)
             if cfg.get("feat_dim", 0):
                 m.color_proj = nn.Linear(cfg["feat_dim"], dim)
-            m.mode_emb = nn.Parameter(torch.zeros(2, dim))
+            if "mode_emb" in sd:
+                m.mode_emb = nn.Parameter(torch.zeros(2, dim))
             m.k_head = nn.Linear(dim, 1)
-            m.col_head = nn.Linear(dim, 6)
-        m.load_state_dict(ck["state_dict"])
+            if "col_head.weight" in sd:
+                m.col_head = nn.Linear(dim, 6)
+        m.load_state_dict(sd)
         self.model = m.to(self.device).eval()
         self.N = N
         self.kernel = _binomial_kernel(self.rows, self.cols).to(self.device)
@@ -121,40 +137,87 @@ class Lite:
                 .to(self.device)
 
     @torch.no_grad()
-    def _predict(self, ink_u8, gh, gw, feats=None, mode=None):
-        M = gh * gw
+    def _predict(self, ink_u8, gh, gw, feats=None, mode=None, ban_idx=None,
+                 stride=1, ensemble="mean", temp=1.0):
+        M = gh * gw                                     # cells in the grid
+        centers = None if stride <= 1 else _strided_centers(gh, gw, stride)
         w = _grid_windows(ink_u8, gh, gw, self.ch, self.cw, self.ph, self.pw,
-                          self.rows, self.cols)
+                          self.rows, self.cols, centers=centers)
         x = torch.from_numpy(w).to(self.device).float().div_(255).unsqueeze(1)
-        ids, valid = _token_maps(gh, gw, self.rows, self.cols)
+        ids, valid = _token_maps(gh, gw, self.rows, self.cols, centers=centers)
         ids_t = torch.from_numpy(ids).to(self.device)
         valid_t = torch.from_numpy(valid).to(self.device)
         feats_tok = (feats[ids_t] * valid_t[:, :, None].float()
                      if feats is not None else None)
-        lo, to = [], []
-        for i in range(0, M, 1024):
+        B = x.shape[0]
+        lo, tt = [], []
+        for i in range(0, B, 1024):
             t = self.model._tokens(x[i:i + 1024], None,
                                    feats_tok[i:i + 1024]
                                    if feats_tok is not None else None, mode)
             lo.append(self.model.head(t[:, self.model.n_extra:]))
-            to.append(t[:, self.model.center])
-        logits, ct = torch.cat(lo), torch.cat(to)
-        probs = logits.softmax(-1)
+            tt.append(t)
+        logits, tok = torch.cat(lo), torch.cat(tt)
         wtok = self.kernel[None, :] * valid_t.float()
-        acc = torch.zeros(M, self.N, device=self.device)
         wsum = torch.zeros(M, device=self.device)
-        acc.index_add_(0, ids_t.reshape(-1),
-                       (probs * wtok[:, :, None]).reshape(-1, self.N))
         wsum.index_add_(0, ids_t.reshape(-1), wtok.reshape(-1))
-        return (acc / wsum[:, None].clamp_min(1e-8)).argmax(-1), ct
+        wsum = wsum.clamp_min(1e-8)
+        probs = logits.softmax(-1)
+        if ensemble == "center":                        # no ensemble: own window only
+            if stride > 1:
+                raise ValueError("ensemble='center' needs stride 1 "
+                                 "(every cell must have its centered window)")
+            tc = (self.rows // 2) * self.cols + self.cols // 2
+            scores = probs[:, tc]                       # windows are in cell order
+        else:                                           # mean / gmean / sample
+            src = probs.clamp_min(1e-9).log() if ensemble == "gmean" else probs
+            acc = torch.zeros(M, self.N, device=self.device)
+            acc.index_add_(0, ids_t.reshape(-1),
+                           (src * wtok[:, :, None]).reshape(-1, self.N))
+            scores = acc / wsum[:, None]
+            if ensemble == "gmean":                     # back to prob space
+                scores = scores.softmax(-1)
+        if ban_idx is not None and ban_idx.numel():     # never snap a banned glyph
+            scores[:, ban_idx] = 0.0
+        if stride <= 1:                                 # windows are in cell order
+            ct = tok[:, self.model.center]
+        else:                                           # per-cell accumulated state
+            cells = tok[:, self.model.n_extra:]
+            accs = torch.zeros(M, cells.shape[-1], device=self.device)
+            accs.index_add_(0, ids_t.reshape(-1),
+                            (cells * wtok[:, :, None]).reshape(-1, cells.shape[-1]))
+            ct = accs / wsum[:, None]
+        if ensemble == "sample":                        # stochastic decode
+            p = scores.clamp_min(0) ** (1.0 / max(temp, 1e-3))
+            pred = torch.multinomial(p.clamp_min(1e-12), 1)[:, 0]
+        else:
+            pred = scores.argmax(-1)
+        return pred, ct
 
     def _txt(self, pred):
         return "\n".join("".join(self.chars[g] for g in row) for row in pred) + "\n"
 
+
     @torch.no_grad()
-    def render(self, image, width=60):
+    def render(self, image, width=60, ban=None, stride=1,
+               ensemble="mean", temp=1.0):
         """image: path or PIL.Image. Color model -> full LiteResult with .ans;
-        line model -> glyph text from the grayscale image."""
+        line model -> glyph text from the grayscale image.
+
+        ban: iterable of characters to exclude from the output (never snapped);
+        the classifier's logits for those glyphs are masked before the argmax.
+        stride: forward windows only at every s-th cell (the dense head covers
+        the cells in between) -- ~stride^2 fewer forwards, fewer framings/cell.
+        ensemble: how the covering windows' predictions combine per cell --
+        'mean' (kernel-weighted arithmetic mean of probs, the default),
+        'gmean' (geometric mean: sharper, a window that rules a glyph out
+        vetoes it), 'center' (no ensemble: own centered window only),
+        'sample' (draw from the mean distribution at temperature `temp`)."""
+        ban_idx = None
+        if ban:
+            bs = set(ban)
+            ban_idx = torch.tensor([i for i, c in enumerate(self.chars) if c in bs],
+                                   device=self.device, dtype=torch.long)
         if isinstance(image, (str, os.PathLike)):
             image = Image.open(image)
         im = ImageOps.exif_transpose(image).convert("RGB")
@@ -164,7 +227,8 @@ class Lite:
         if not self.color:
             gray = np.asarray(im.convert("L"), np.float32) / 255.0
             ink_u8 = np.clip((1.0 - gray) * 255.0, 0, 255).astype(np.uint8)
-            g, _ = self._predict(ink_u8, gh, width)
+            g, _ = self._predict(ink_u8, gh, width, ban_idx=ban_idx,
+                                 stride=stride, ensemble=ensemble, temp=temp)
             pred = g.view(gh, width).cpu().numpy()
             return LiteResult(pred, self._txt(pred), None, None, None, None, None)
         from unicasso.engine.color import decompose, nomination_target
@@ -176,7 +240,9 @@ class Lite:
         mean = dec["cell_rgb"].mean(1)
         feats = torch.cat([dec["gate"][:, None], (dec["sep"] / 20.0)[:, None],
                            dec["fg"], dec["bg"], mean], dim=1).float().to(self.device)
-        g, ct = self._predict(ink_u8, gh, width, feats=feats, mode=1)
+        g, ct = self._predict(ink_u8, gh, width, feats=feats, mode=1,
+                              ban_idx=ban_idx, stride=stride,
+                              ensemble=ensemble, temp=temp)
         khat = 4.0 * torch.sigmoid(self.model.k_head(ct)[:, 0] + K_BIAS)
         mask = self.ink_flat[g]
         C = dec["cell_rgb"].to(self.device)
@@ -215,6 +281,22 @@ def main():
                    help="write the render here instead of stdout (stdout is clean ANSI/text, "
                         "safe to pipe or cat)")
     p.add_argument("--png", default=None, help="also save the pixel render as a PNG (color model)")
+    p.add_argument("--ban-chars", default="", help="characters to exclude from the output")
+    p.add_argument("--ban-blocks", action="store_true", help="also exclude block chars ░▒▓█▄▌▐▀■")
+    p.add_argument("--ban-letters", action="store_true",
+                   help="also exclude all Unicode letters (A-Z a-z + accented)")
+    p.add_argument("--stride", type=int, default=1,
+                   help="window stride in cells: forward only every s-th window, the dense "
+                        "head covers the rest (~s^2 speedup, fewer framings per cell)")
+    p.add_argument("--ensemble", default="mean",
+                   choices=["mean", "gmean", "center", "sample"],
+                   help="per-cell combination of the covering windows' predictions: "
+                        "mean = kernel-weighted arithmetic mean (default), gmean = "
+                        "geometric mean (sharper, veto-like), center = no ensemble "
+                        "(own window only, needs stride 1), sample = stochastic "
+                        "draw from the mean distribution")
+    p.add_argument("--temp", type=float, default=1.0,
+                   help="sampling temperature for --ensemble sample (lower = greedier)")
     p.add_argument("--device", default=None, help="torch device (default: auto -- cuda/mps/cpu)")
     args = p.parse_args()
     import contextlib
@@ -225,7 +307,12 @@ def main():
     if width <= 0:                                    # 0 = fill the terminal when on a screen
         import shutil
         width = shutil.get_terminal_size((60, 20)).columns if sys.stdout.isatty() else 60
-    out = lite.render(args.image, width=width)
+    ban = set(args.ban_chars) | (set("░▒▓█▄▌▐▀■") if args.ban_blocks else set())
+    if args.ban_letters:
+        import unicodedata
+        ban |= {c for c in lite.chars if unicodedata.category(c).startswith("L")}
+    out = lite.render(args.image, width=width, ban=ban or None,
+                      stride=args.stride, ensemble=args.ensemble, temp=args.temp)
     text = out.txt if args.line or out.ans is None else out.ans
     if args.out:
         with open(args.out, "w") as f:

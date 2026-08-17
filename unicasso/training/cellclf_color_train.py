@@ -126,6 +126,12 @@ def main():
     p.add_argument("--warmup", type=int, default=30)
     p.add_argument("--blank-weight", type=float, default=0.2)
     p.add_argument("--chunk", type=int, default=384)
+    p.add_argument("--mode-token", action="store_true",
+                   help="add the lineart/photo task-token embedding (v1 measured it "
+                        "dead -- norm 0.024 vs token norm ~30 -- so default off)")
+    p.add_argument("--photo-color-aux", type=float, default=0.0,
+                   help="MSE weight tying col_head to the closed-form blend fg/bg on "
+                        "photo steps (unscaled by lambda; 0 = the shipped v1 recipe)")
     p.add_argument("--eval-every", type=int, default=100)
     p.add_argument("--eval-cells", type=int, default=40000)
     p.add_argument("--holdout-parents", default="00094,00177")
@@ -179,12 +185,14 @@ def main():
                                  in_ch=cfg.get("in_ch", 1),
                                  clip_dim=cache.clip_dim if cfg.get("clip_token") else 0)
         dim0 = cfg.get("dim", 64)
+        sd0 = ck["state_dict"]
         if cfg.get("feat_dim", 0):
             model.color_proj = nn.Linear(cfg["feat_dim"], dim0)
-        model.mode_emb = nn.Parameter(torch.zeros(2, dim0))
+        if "mode_emb" in sd0:
+            model.mode_emb = nn.Parameter(torch.zeros(2, dim0))
         model.k_head = nn.Linear(dim0, 1)
         model.col_head = nn.Linear(dim0, 6)
-        model.load_state_dict(ck["state_dict"])
+        model.load_state_dict(sd0)
         model = model.to(device).train()
         print(f"  continued from color model {args.init}", flush=True)
     else:
@@ -206,7 +214,8 @@ def main():
             model.color_proj = nn.Linear(FEAT_DIM, dim).to(device)
             nn.init.zeros_(model.color_proj.weight)
             nn.init.zeros_(model.color_proj.bias)
-        model.mode_emb = nn.Parameter(torch.zeros(2, dim, device=device))
+        if args.mode_token:                      # measured dead in v1; off by default
+            model.mode_emb = nn.Parameter(torch.zeros(2, dim, device=device))
         model.k_head = nn.Linear(dim, 1).to(device)
         nn.init.zeros_(model.k_head.weight); nn.init.zeros_(model.k_head.bias)
         model.col_head = nn.Linear(dim, 6).to(device)
@@ -227,13 +236,14 @@ def main():
     from unicasso.engine.clip_loss import CLIPPerceptualLoss
     clipper = CLIPPerceptualLoss(torch.device(device), model_name="RN101",
                                  pretrained="openai", n_aug=args.clip_aug,
-                                 crop_scale=(0.3, 0.95))
+                                 crop_scale=(0.3, 0.95),
+                                 batch_aug=(device == "cuda"))
     clip_val_stems = [r["stem"] for r in cache.meta["runs"]
                       if r["split"] == "val"][:4]
     photos = sorted(sum((glob.glob(os.path.join(G.repo_path(args.photos), e))
-                         for e in ("*.jpg", "*.jpeg", "*.png")), []))
+                         for e in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG")), []))
     eval_photos = (sorted(sum((glob.glob(os.path.join(G.repo_path(args.eval_photos), e))
-                               for e in ("*.jpg", "*.jpeg", "*.png")), []))
+                               for e in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG")), []))
                    if args.eval_photos else [])
     ktarg = []
     if args.k_targets:
@@ -372,8 +382,9 @@ def main():
         fg = fg + (fg.clamp(0, 1) - fg).detach()
         bg = bg + (bg.clamp(0, 1) - bg).detach()
         cell = bg[:, None, :] + (fg - bg)[:, None, :] * mask[:, :, None]
-        return cell.view(gh, gw, ch, cw, 3).permute(0, 2, 1, 3, 4) \
+        img = cell.view(gh, gw, ch, cw, 3).permute(0, 2, 1, 3, 4) \
             .reshape(gh * ch, gw * cw, 3)
+        return img, fg0, bg0
 
     def color_render_loss(path, rgb, dec, ink_u8, gh, gw, k_target=None,
                           refine=False, reg_mult=1.0):
@@ -391,17 +402,24 @@ def main():
         g = (pbar.clamp_min(1e-9).log() - torch.log(-torch.log(u))).argmax(-1)
         st = F.one_hot(g, N).float() + pbar - pbar.detach()
         mask = st @ ink_flat_d
-        img = color_image(g, khat, dec, mask, gh, gw)
+        img, fg0, bg0 = color_image(g, khat, dec, mask, gh, gw)
         rgb_d = rgb.to(device)
         loss = clipper(img, rgb_d)
+        aux_l = khat.new_zeros(())
+        if args.photo_color_aux > 0:
+            # optional col_head aux vs the closed-form blend (unscaled: rides
+            # the lk channel so lambda cannot dilute it)
+            pc = torch.sigmoid(model.col_head(ct))
+            aux_l = args.photo_color_aux * F.mse_loss(
+                pc, torch.cat([fg0, bg0], dim=-1).detach().clamp(0, 1))
         kf = khat.view(gh, gw)
         loss = loss + reg_mult * args.tv_weight * (
             (kf[:, 1:] - kf[:, :-1]).pow(2).mean()
             + (kf[1:] - kf[:-1]).pow(2).mean())
         loss = loss + reg_mult * args.k_prior * (khat - 1.0).pow(2).mean()
-        lk = khat.new_zeros(())
+        lk = aux_l
         if k_target is not None:
-            lk = args.k_reg_weight * F.mse_loss(khat, k_target)
+            lk = aux_l + args.k_reg_weight * F.mse_loss(khat, k_target)
         elif refine:
             # semi-stochastic target: a few CLIP iterations FROM the model's own
             # k_hat over frozen glyphs/colors; supervise the difference
@@ -432,7 +450,7 @@ def main():
                 ropt.step()
                 with torch.no_grad():
                     k0.data.clamp_(0.0, 4.0)
-            lk = args.k_reg_weight * F.mse_loss(khat, k0.detach().view(-1))
+            lk = aux_l + args.k_reg_weight * F.mse_loss(khat, k0.detach().view(-1))
         return loss, lk, float(khat.mean()), float((g != cache.space).float().mean())
 
     def coltext_batch():
@@ -500,7 +518,7 @@ def main():
             logits, ct = forward_region(x, feats_tok, 1, emb)
             khat = 4.0 * torch.sigmoid(model.k_head(ct)[:, 0] + K_BIAS)
             g = ensemble(logits, ids_t, valid_t, M).argmax(-1)
-            img = color_image(g, khat, dec, ink_flat_d[g], gh, 50)
+            img, _, _ = color_image(g, khat, dec, ink_flat_d[g], gh, 50)
             losses.append(float(clipper(img, rgb.to(device))))
             kms.append(float(khat.mean()))
         pyr.setstate(st)

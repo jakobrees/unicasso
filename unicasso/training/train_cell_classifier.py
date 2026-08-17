@@ -206,7 +206,8 @@ class TokenTransformer(nn.Module):
         self.n_extra = 1 if self.use_clip else 0
         self.center = (rows // 2) * cols + cols // 2 + self.n_extra
 
-    def _tokens(self, x, clip_emb, feats=None, mode=None):
+    def _embed(self, x, clip_emb, feats=None, mode=None):
+        """Per-window token embeddings: everything up to (not including) the blocks."""
         B = x.shape[0]
         in_ch = getattr(self, "in_ch", 1)
         if in_ch == 4 and x.shape[1] == 1:
@@ -228,9 +229,127 @@ class TokenTransformer(nn.Module):
         if self.use_clip:
             c = self.clip_proj(clip_emb).unsqueeze(1) + self.clip_pos
             t = torch.cat([c, t], dim=1)
+        return t
+
+    def _run_blocks(self, t):
         for blk in self.blocks:
             t = blk(t)
         return self.ln_out(t)
+
+    def _tokens(self, x, clip_emb, feats=None, mode=None):
+        return self._run_blocks(self._embed(x, clip_emb, feats, mode))
+
+    def forward(self, x, clip_emb=None):
+        f = self.extra(self.trunk(x))
+        return self.head(f.flatten(1))
+
+
+class Block(nn.Module):
+    """Pre-LN transformer block."""
+
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.ln2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+
+    def forward(self, t):
+        h = self.ln1(t)
+        t = t + self.attn(h, h, h, need_weights=False)[0]
+        return t + self.mlp(self.ln2(t))
+
+
+class TokenTransformer(nn.Module):
+    """Per-cell CNN tokens + n_blocks pre-LN transformer blocks.
+
+    forward() -> center-token logits (the classifier interface everything evals);
+    forward_all() -> (B, rows*cols, N) logits for every window cell, for the
+    dense multi-cell objective and framing-ensemble inference.
+    """
+
+    def __init__(self, rows, cols, cell_h, cell_w, pad_h, pad_w, n_classes,
+                 dim=64, heads=4, clip_dim=0, n_blocks=1, in_ch=1):
+        super().__init__()
+        self.rows, self.cols = rows, cols
+        self.in_ch = in_ch
+        self.th, self.tw = cell_h + 2 * pad_h, cell_w + 2 * pad_w   # token patch 40x24
+        self.sh, self.sw = cell_h, cell_w                           # patch stride
+        self.trunk = conv_trunk(in_ch)
+        with torch.no_grad():
+            f = self.trunk(torch.zeros(1, in_ch, self.th, self.tw))
+        self.proj = nn.Linear(f.numel(), dim)
+        self.pos = nn.Parameter(torch.randn(rows * cols, dim) * 0.02)
+        self.use_clip = clip_dim > 0
+        if self.use_clip:
+            self.clip_proj = nn.Linear(clip_dim, dim)
+            self.clip_pos = nn.Parameter(torch.randn(1, dim) * 0.02)
+        self.blocks = nn.ModuleList(Block(dim, heads) for _ in range(n_blocks))
+        self.ln_out = nn.LayerNorm(dim)
+        self.head = head(dim, n_classes)
+        self.n_extra = 1 if self.use_clip else 0
+        self.center = (rows // 2) * cols + cols // 2 + self.n_extra
+
+    def _embed(self, x, clip_emb, feats=None, mode=None):
+        """Per-window token embeddings: everything up to (not including) the blocks."""
+        B = x.shape[0]
+        in_ch = getattr(self, "in_ch", 1)
+        if in_ch == 4 and x.shape[1] == 1:
+            # ink-only input to a color-conv model: color channels = the visual
+            # image (white paper, dark ink) so lineart tooling works unchanged
+            x = torch.cat([x, (1.0 - x).repeat(1, 3, 1, 1)], dim=1)
+        # window (B,C,H,W) -> overlapping per-cell patches (B*T,C,40,24)
+        p = x.unfold(2, self.th, self.sh).unfold(3, self.tw, self.sw)
+        p = p.reshape(B, x.shape[1], self.rows * self.cols, self.th, self.tw)
+        p = p.permute(0, 2, 1, 3, 4).reshape(-1, x.shape[1], self.th, self.tw)
+        t = self.proj(self.trunk(p).flatten(1)).view(B, -1, self.pos.shape[1])
+        t = t + self.pos
+        # color-model extensions (created by surgery in the color trainer; both
+        # zero-init so the base model's behavior is the exact starting point)
+        if feats is not None and getattr(self, "color_proj", None) is not None:
+            t = t + self.color_proj(feats)               # feats (B, T, F) per cell
+        if mode is not None and getattr(self, "mode_emb", None) is not None:
+            t = t + self.mode_emb[mode][None, None, :]   # task token, added to all
+        if self.use_clip:
+            c = self.clip_proj(clip_emb).unsqueeze(1) + self.clip_pos
+            t = torch.cat([c, t], dim=1)
+        return t
+
+    def _run_blocks(self, t, mix=None):
+        """Block loop. mix = (ids, valid, kernel, n_cells, alpha) turns on
+        cross-window residual mixing: after each block, the residual it produced
+        on every cell token is replaced by (1-a)*own + a*(binomial-weighted mean
+        of the residuals ALL overlapping windows produced for that same grid
+        cell). Requires the batch to be one contiguous region (ids = per-token
+        global cell index, as in framing-ensemble accumulation). The averaging
+        is linear, so autograd routes each cell's gradient into every window
+        covering it; framing-disagreement components are averaged out of the
+        forward, so updates push the consensus state rather than per-framing
+        fits."""
+        if mix is None:
+            for blk in self.blocks:
+                t = blk(t)
+            return self.ln_out(t)
+        ids, valid, kernel, n_cells, alpha = mix
+        B, _, d = t.shape
+        w = kernel[None, :] * valid.float()               # (B, T_cells)
+        flat_ids = ids.reshape(-1)
+        wsum = torch.zeros(n_cells, device=t.device, dtype=t.dtype)
+        wsum.index_add_(0, flat_ids, w.reshape(-1))
+        wsum = wsum.clamp_min(1e-8)
+        for blk in self.blocks:
+            r = blk(t) - t                                # the block's residual
+            rc = r[:, self.n_extra:]
+            acc = torch.zeros(n_cells, d, device=t.device, dtype=t.dtype)
+            acc.index_add_(0, flat_ids, (rc * w[..., None]).reshape(-1, d))
+            ravg = (acc / wsum[:, None])[ids]             # (B, T_cells, d)
+            rmix = torch.where(valid[..., None],
+                               (1 - alpha) * rc + alpha * ravg, rc)
+            t = t + torch.cat([r[:, :self.n_extra], rmix], dim=1)
+        return self.ln_out(t)
+
+    def _tokens(self, x, clip_emb, feats=None, mode=None, mix=None):
+        return self._run_blocks(self._embed(x, clip_emb, feats, mode), mix)
 
     def forward(self, x, clip_emb=None, feats=None, mode=None):
         return self.head(self._tokens(x, clip_emb, feats, mode)[:, self.center])
@@ -688,6 +807,10 @@ def main():
     p.add_argument("--consistency-weight", type=float, default=0.0,
                    help="symmetric-KL between two 1-cell-shifted framings on their overlapping "
                         "cells (requires --dense); makes adjacent-cell errors coherent")
+    p.add_argument("--consistency-decay", type=float, default=1.0,
+                   help="end-of-run consistency weight as a fraction of the start, linear "
+                        "ramp (0.25 = decay to a quarter; stabilizes early, frees late "
+                        "commitment). 1.0 = constant")
     p.add_argument("--render-frac", type=float, default=0.0,
                    help="fraction of steps trained on synthetic letter-render batches "
                         "(jittered re-renders of real label windows; requires --dense)")
@@ -801,7 +924,8 @@ def main():
         from unicasso.engine.clip_loss import CLIPPerceptualLoss
         clipper = CLIPPerceptualLoss(torch.device(device), model_name="RN101",
                                      pretrained="openai", n_aug=args.clip_aug,
-                                     crop_scale=(0.4, 0.9))
+                                     crop_scale=(0.4, 0.9),
+                                     batch_aug=(device == "cuda"))
         clip_val_stems = [r["stem"] for r in cache.meta["runs"]
                           if r["split"] == "val"][:4]
     if args.render_frac > 0:
@@ -886,7 +1010,10 @@ def main():
                                             maps)
                 else:
                     cons = l1.new_zeros(())
-                loss = ce_loss + args.consistency_weight * cons
+                cw_now = args.consistency_weight * (
+                    1.0 + (args.consistency_decay - 1.0)
+                    * step / max(1, args.steps - 1))
+                loss = ce_loss + cw_now * cons
                 logits, y_c = l1[:, tc], y[:, tc]
             else:
                 logits = model(x, ce)

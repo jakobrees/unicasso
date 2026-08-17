@@ -42,10 +42,17 @@ def main():
     p.add_argument("--clip-aug", type=int, default=8)
     p.add_argument("--tv-weight", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--shard", default=None,
+                   help="'i/n': process photos[i::n] -- multi-process GPU sharding "
+                        "(pair with the CUDA MPS daemon, see docs/adapter.md)")
+    p.add_argument("--limit", type=int, default=0,
+                   help="stop after N NEW samples (0 = no limit; benchmarking)")
     p.add_argument("--device", default=None)
     args = p.parse_args()
 
-    device = args.device or ("mps" if torch.backends.mps.is_available() else "cpu")
+    device = args.device or ("cuda" if torch.cuda.is_available()
+                             else "mps" if torch.backends.mps.is_available()
+                             else "cpu")
     rng = np.random.default_rng(args.seed)
     meta = json.load(open(G.repo_path("runs/cellclf/cache_full/meta.json")))
     ch, cw = meta["cell_h"], meta["cell_w"]
@@ -67,24 +74,33 @@ def main():
                          heads=cfg.get("heads", 4), n_blocks=cfg.get("blocks", 3),
                          in_ch=cfg.get("in_ch", 1))
     dim = cfg.get("dim", 64)
+    sd = ck["state_dict"]
     if cfg.get("feat_dim", 0):
         m.color_proj = nn.Linear(cfg["feat_dim"], dim)
-    m.mode_emb = nn.Parameter(torch.zeros(2, dim))
+    if "mode_emb" in sd:
+        m.mode_emb = nn.Parameter(torch.zeros(2, dim))
     m.k_head = nn.Linear(dim, 1)
-    m.col_head = nn.Linear(dim, 6)
-    m.load_state_dict(ck["state_dict"])
+    if "col_head.weight" in sd:
+        m.col_head = nn.Linear(dim, 6)
+    m.load_state_dict(sd)
     m = m.to(device).eval()
 
     from unicasso.engine.clip_loss import CLIPPerceptualLoss
     clipper = CLIPPerceptualLoss(torch.device(device), model_name="RN101",
                                  pretrained="openai", n_aug=args.clip_aug,
-                                 crop_scale=(0.4, 0.9))
+                                 crop_scale=(0.4, 0.9),
+                                 batch_aug=(device == "cuda"))
 
     photos = sorted(sum((glob.glob(os.path.join(G.repo_path(args.photos), e))
-                         for e in ("*.jpg", "*.jpeg", "*.png")), []))
+                         for e in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG")), []))
+    shard_tag = ""
+    if args.shard:
+        si, sn = (int(v) for v in args.shard.split("/"))
+        photos = photos[si::sn]
+        shard_tag = f" shard {si}/{sn}"
     outdir = G.repo_path(args.out)
     os.makedirs(outdir, exist_ok=True)
-    print(f"[ktargets] {len(photos)} photos x {args.variants} variants | "
+    print(f"[ktargets] {len(photos)} photos x {args.variants} variants{shard_tag} | "
           f"{args.k_steps} muon steps lr {args.k_lr} aug {args.clip_aug} | {device}",
           flush=True)
 
@@ -183,10 +199,14 @@ def main():
             if device == "mps":
                 torch.mps.empty_cache()
             done += 1
-            if done % 20 == 0:
+            if done % 20 == 0 or (args.limit and done >= args.limit):
                 rate = (time.time() - t0) / done
                 print(f"  {done} samples ({rate:.1f} s/sample, "
                       f"last kstd {kd.std():.2f})", flush=True)
+            if args.limit and done >= args.limit:
+                break
+        if args.limit and done >= args.limit:
+            break
     print(f"KTARGETS_DONE ({done} new samples, "
           f"{(time.time()-t0)/60:.0f} min)", flush=True)
 
