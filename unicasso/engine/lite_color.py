@@ -53,8 +53,11 @@ class LiteColorer:
     """
 
     def __init__(self, ckpt, image, gh, gw, device=None, font=None,
-                 ink="render", read=None, k_scale=0.0, chunk=512):
+                 ink="render", read=None, k_scale=0.0, chunk=512, bg_fixed=None):
         self.lite = Lite(ckpt, device=device, font=font)
+        # --color-fg: the paper colour; fg is refit through the model's mask
+        # with bg pinned, the model's own bg colour is discarded
+        self.bg_fixed = None if bg_fixed is None else torch.as_tensor(bg_fixed).float()
         if getattr(self.lite.model, "mask_dec", None) is None:
             raise ValueError(f"--color-lite: {ckpt} has no mask decoder")
         self.dev = self.lite.device
@@ -189,12 +192,21 @@ class LiteColorer:
                                    frac=r["frac"], weight=r["weight"],
                                    ridge=r["ridge"], count=r["count"],
                                    temp=r["temp"])
+            if self.bg_fixed is not None:
+                from unicasso.engine.color import fit_fg_fixed_bg
+                bgc = self.bg_fixed.to(fg.device)
+                fg = fit_fg_fixed_bg(self.cell_rgb[cs], pm[:, 0].reshape(pm.shape[0], -1),
+                                     bgc, ridge=max(r["ridge"], 1e-3)).clamp(0, 1)
+                bg = bgc.expand_as(fg)
             if self.k_scale:
                 khat = 4.0 * torch.sigmoid(m.k_head(t[:, m.center])[:, 0] + K_BIAS)
                 kf = (1.0 + self.k_scale * (khat - 1.0))[:, None]
-                mid = 0.5 * (fg + bg)
-                fg = (mid + kf * (fg - mid)).clamp(0, 1)
-                bg = (mid + kf * (bg - mid)).clamp(0, 1)
+                if self.bg_fixed is not None:
+                    fg = (bg + kf * (fg - bg)).clamp(0, 1)
+                else:
+                    mid = 0.5 * (fg + bg)
+                    fg = (mid + kf * (fg - mid)).clamp(0, 1)
+                    bg = (mid + kf * (bg - mid)).clamp(0, 1)
             fgs.append(fg.detach())
             bgs.append(bg.detach())
             del x, t, s1, mlog, pm, ft, ids_t, valid_t

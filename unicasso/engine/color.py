@@ -174,6 +174,45 @@ def fit_fg_bg(cell_rgb, mask, ridge=1e-3, bg_w=None):
     return fg, bg
 
 
+def fit_fg_fixed_bg(cell_rgb, mask, bg, ridge=1e-3):
+    """Closed-form fg for a PINNED background (--color-fg): minimise
+    ||bg + m*(fg - bg) - c||^2 over fg alone, bg held at the paper colour:
+        fg - bg = sum_p m_p (c_p - bg) / (sum_p m_p^2 + ridge)
+    cell_rgb (M,P,3); mask (M,P) or (M,K,P) in [0,1] (hard glyph ink, or a
+    lite mask's fg probability); bg (3,). A cell with no ink stays at bg."""
+    d = cell_rgb - bg.to(cell_rgb.dtype).view(1, 1, 3)
+    if mask.dim() == 2:
+        num = torch.einsum("mp,mpc->mc", mask, d)
+        den = (mask * mask).sum(-1, keepdim=True) + ridge
+        return bg.view(1, 3) + num / den
+    num = torch.einsum("mkp,mpc->mkc", mask, d)
+    den = (mask * mask).sum(-1, keepdim=True) + ridge
+    return bg.view(1, 1, 3) + num / den
+
+
+def parse_bg_color(spec, rgb=None):
+    """--bg spec -> (3,) float tensor in [0,1]. 'white' | 'black' | '#rrggbb' |
+    'auto' = median colour of the image border (rgb (H,W,3) in [0,1] required;
+    line art on tinted paper)."""
+    s = str(spec).strip().lower()
+    if s == "white":
+        return torch.ones(3)
+    if s == "black":
+        return torch.zeros(3)
+    if s.startswith("#") and len(s) == 7:
+        return torch.tensor([int(s[i:i + 2], 16) / 255.0 for i in (1, 3, 5)])
+    if s == "auto":
+        if rgb is None:
+            raise ValueError("--bg auto needs the image")
+        t = torch.as_tensor(rgb).float()
+        h, w = t.shape[:2]
+        b = max(1, int(round(0.02 * min(h, w))))
+        border = torch.cat([t[:b].reshape(-1, 3), t[-b:].reshape(-1, 3),
+                            t[:, :b].reshape(-1, 3), t[:, -b:].reshape(-1, 3)])
+        return border.median(0).values.clamp(0, 1)
+    raise ValueError(f"--bg: expected white | black | #rrggbb | auto, got {spec!r}")
+
+
 @torch.no_grad()
 def glyph_bg_dist(ink_flat, ch, cw):
     """(N, P) glyph ink masks -> (N, P) distance of each pixel to the glyph's nearest

@@ -438,6 +438,15 @@ class Lite:
         return g, pm, mlog.softmax(1), C_full
 
     @torch.no_grad()
+    def _pin_bg(self, fg, bg, m, C, bgc, ridge):
+        """--color-fg: refit fg through the mask/ink `m` with the background
+        pinned to the paper colour `bgc`; bg becomes that constant. The k /
+        blend already applied to fg is discarded -- with the paper fixed the
+        contrast is whatever the fit says."""
+        from unicasso.engine.color import fit_fg_fixed_bg
+        fgp = fit_fg_fixed_bg(C, m, bgc, ridge=max(float(ridge), 1e-3)).clamp(0, 1)
+        return fgp, bgc.to(fgp.dtype).expand_as(fgp)
+
     def _khat(self, ct):
         """Per-cell contrast from the legacy k_head; k=1 (neutral, exactly what
         a zero head gives through 4*sigmoid(0+K_BIAS)) when the model has none."""
@@ -514,7 +523,8 @@ class Lite:
     @torch.no_grad()
     def recolor(self, image, glyphs, color_path="topk", topk_frac=0.25,
                 topk_weight="prob", topk_count="auto", sample_temp=1.0,
-                fit_ridge=0.0, k_scale=0.0, flat_thresh=0.0):
+                fit_ridge=0.0, k_scale=0.0, flat_thresh=0.0,
+                color_fg=False, bg="white"):
         """Color a grid the model did NOT choose, using the model's own masks.
 
         `glyphs`: (gh,gw) int array, or a path / text block of glyph rows (the
@@ -545,6 +555,10 @@ class Lite:
         from unicasso.engine.color import decompose
         from unicasso.training.cellclf_color import ansi_txt, fit_fg_bg_distweighted
         rgb = torch.from_numpy(np.asarray(im, np.float32) / 255.0)
+        bg_fixed = None
+        if color_fg:
+            from unicasso.engine.color import parse_bg_color
+            bg_fixed = parse_bg_color(bg, rgb).to(self.device)
         dec = decompose(rgb, gh, gw, self.ch, self.cw)
         feats = torch.cat([dec["gate"][:, None], (dec["sep"] / 20.0)[:, None],
                            dec["fg"], dec["bg"], dec["cell_rgb"].mean(1)],
@@ -587,6 +601,12 @@ class Lite:
         mid = 0.5 * (fg0 + bg0)
         fg = (mid + kf[:, None] * (fg0 - mid)).clamp(0, 1)
         bg = (mid + kf[:, None] * (bg0 - mid)).clamp(0, 1)
+        if bg_fixed is not None:
+            # pin first: under --color-fg a cell is "flat" when its ink would be
+            # invisible ON THE PAPER, not when fg ~ its own free background
+            m_ = pm[:, 0].reshape(pm.shape[0], -1) if pm is not None else self.ink_flat[g]
+            fg, bg = self._pin_bg(fg, bg, m_, dec["cell_rgb"].to(self.device),
+                                  bg_fixed, fit_ridge)
         if flat_thresh > 0 and " " in self.chars:
             flat = (fg - bg).abs().mean(1) < flat_thresh
             g = torch.where(flat, torch.full_like(g, self.chars.index(" ")), g)
@@ -598,14 +618,15 @@ class Lite:
         pred = g.view(gh, gw).cpu().numpy()
         return LiteResult(pred, self._txt(pred),
                           ansi_txt(pred, self.chars, fg.cpu().numpy(),
-                                   bg.cpu().numpy(), gh, gw),
+                                   bg.cpu().numpy(), gh, gw,
+                                   fg_only=bg_fixed is not None),
                           fg.cpu().numpy(), bg.cpu().numpy(),
                           kf.view(gh, gw).cpu().numpy(), render,
                           masks=None if pm is None else pm.cpu().numpy())
 
     @torch.no_grad()
     def render(self, image, width=60, ban=None, stride=1,
-               ensemble=None, temp=1.0, color_path="auto", topk_frac=0.5,
+               ensemble=None, temp=1.0, color_fg=False, bg="white", color_path="auto", topk_frac=0.5,
                topk_weight="prob", topk_count="auto", sample_temp=1.0,
                fit_ridge=1.0, k_scale=1.0, flat_thresh=0.0,
                mask_forward=None):
@@ -673,6 +694,10 @@ class Lite:
         from unicasso.engine.color import decompose, nomination_target
         from unicasso.training.cellclf_color import ansi_txt, fit_fg_bg_distweighted
         rgb = torch.from_numpy(np.asarray(im, np.float32) / 255.0)
+        bg_fixed = None
+        if color_fg:
+            from unicasso.engine.color import parse_bg_color
+            bg_fixed = parse_bg_color(bg, rgb).to(self.device)
         dec = decompose(rgb, gh, width, self.ch, self.cw)
         ink_u8 = np.clip((1.0 - nomination_target(dec).numpy()) * 255.0,
                          0, 255).astype(np.uint8)
@@ -680,6 +705,10 @@ class Lite:
         feats = torch.cat([dec["gate"][:, None], (dec["sep"] / 20.0)[:, None],
                            dec["fg"], dec["bg"], mean], dim=1).float().to(self.device)
         rgb01 = np.asarray(im, np.float32) / 255.0
+        bg_fixed = None
+        if color_fg:
+            from unicasso.engine.color import parse_bg_color
+            bg_fixed = parse_bg_color(bg, rgb01).to(self.device)
         mf = mask_forward or self.mask_forward
         one_fwd = (mf == "one" and getattr(self.model, "mask_dec", None) is not None
                    and color_path != "legacy")
@@ -737,6 +766,9 @@ class Lite:
             bg = (mid + kf[:, None] * (bgm - mid)).clamp(0, 1)
             # fg == bg renders any glyph invisible: such a cell is EMPTY --
             # ship the space glyph instead of a phantom character
+            if bg_fixed is not None:      # pin BEFORE the flat test (see recolor)
+                fg, bg = self._pin_bg(fg, bg, pm[:, 0].reshape(pm.shape[0], -1),
+                                      dec["cell_rgb"].to(self.device), bg_fixed, fit_ridge)
             if " " in self.chars:
                 flat = (fg - bg).abs().mean(1) < flat_thresh
                 g = torch.where(flat,
@@ -749,7 +781,8 @@ class Lite:
             pred = g.view(gh, width).cpu().numpy()
             return LiteResult(pred, self._txt(pred),
                               ansi_txt(pred, self.chars, fg.cpu().numpy(),
-                                       bg.cpu().numpy(), gh, width),
+                                       bg.cpu().numpy(), gh, width,
+                                       fg_only=bg_fixed is not None),
                               fg.cpu().numpy(), bg.cpu().numpy(),
                               kf.view(gh, width).cpu().numpy(), render,
                               masks=pm.cpu().numpy())
@@ -772,6 +805,8 @@ class Lite:
         mid = 0.5 * (fg0 + bg0)
         fg = (mid + khat[:, None] * (fg0 - mid)).clamp(0, 1)
         bg = (mid + khat[:, None] * (bg0 - mid)).clamp(0, 1)
+        if bg_fixed is not None:
+            fg, bg = self._pin_bg(fg, bg, mask, C, bg_fixed, fit_ridge)
         cell = bg[:, None, :] + (fg - bg)[:, None, :] * mask[:, :, None]
         render = cell.view(gh, width, self.ch, self.cw, 3) \
             .permute(0, 2, 1, 3, 4).reshape(gh * self.ch, width * self.cw, 3) \
@@ -779,7 +814,8 @@ class Lite:
         pred = g.view(gh, width).cpu().numpy()
         return LiteResult(pred, self._txt(pred),
                           ansi_txt(pred, self.chars, fg.cpu().numpy(),
-                                   bg.cpu().numpy(), gh, width),
+                                   bg.cpu().numpy(), gh, width,
+                                   fg_only=bg_fixed is not None),
                           fg.cpu().numpy(), bg.cpu().numpy(),
                           khat.view(gh, width).cpu().numpy(), render)
 
@@ -947,7 +983,8 @@ def color_refine(lite, image_path, result, width, iters, rounds=5, lead=1.0,
     return lite.recolor(image_path, gp, flat_thresh=0.0, **read)
 
 
-def auto_refine(lite, image_path, result, width, iters, extra=(), progress=True):
+def auto_refine(lite, image_path, result, width, iters, extra=(), progress=True,
+                color_fg=False, bg="white", ink_target="cluster"):
     """`--refine N`: polish a lite result with N iterations of the full
     optimizer, the way the v2 models' own training pools were refined. The
     path is chosen from the model, nothing to configure:
@@ -984,6 +1021,9 @@ def auto_refine(lite, image_path, result, width, iters, extra=(), progress=True)
            "--progress-every", "25" if progress else "0"]
     mask_model = lite.color and getattr(lite.model, "mask_dec", None) is not None
     read = dict(color_path="blend", fit_ridge=1.0)   # what Lite ships by default
+    if color_fg and lite.color:
+        cmd += ["--color-fg", "--bg", str(bg), "--ink-target", ink_target]   # the engine renders on the paper too
+        read.update(color_fg=True, bg=bg)
     if mask_model:
         cmd += ["--color", "--color-lite", lite.ckpt_path,
                 "--color-lite-mode", "birth", "--color-lite-ink", "render",
@@ -1056,6 +1096,20 @@ def main():
                    choices=["mean", "gmean", "center", "sample"], help=argparse.SUPPRESS)
     p.add_argument("--temp", type=float, default=1.0, help=argparse.SUPPRESS)
     p.add_argument("--device", default=None, help="torch device (default: auto -- cuda/mps/cpu)")
+    p.add_argument("--color-fg", action="store_true",
+                   help="FOREGROUND-ONLY colour: the background is a fixed paper colour "
+                        "(--bg) that is never fitted, and the output carries foreground "
+                        "codes only so the terminal's own background shows through. "
+                        "Coloured line art on white -> coloured ASCII line art. Best "
+                        "with --refine, which then optimizes the glyphs on that paper")
+    p.add_argument("--bg", default="white", metavar="COLOR",
+                   help="(--color-fg) the paper colour: white (default) | black | #rrggbb "
+                        "| auto (median of the image border). Pick your terminal's background")
+    p.add_argument("--ink-target", default="cluster", choices=["cluster", "bg-offset"],
+                   help="(--color-fg --refine) what the optimizer treats as ink: "
+                        "'cluster' (per-cell two-colour clustering, default) or "
+                        "'bg-offset' (distance from --bg -- for line art on a solid "
+                        "background)")
     p.add_argument("--refine", type=int, default=0, metavar="N",
                    help="polish the result with N iterations of the full optimizer "
                         "(needs the engine deps; ~minutes). Line art is refined in "
@@ -1111,6 +1165,7 @@ def main():
         ft = 0.0 if args.flat_thresh is None else args.flat_thresh
         cp = "topk" if args.color_path == "auto" else args.color_path
         out = lite.recolor(args.image, args.color_text, color_path=cp,
+                           color_fg=args.color_fg, bg=args.bg,
                            topk_frac=args.topk_frac, topk_weight=args.topk_weight,
                            topk_count=args.topk_count, sample_temp=args.sample_temp,
                            fit_ridge=args.fit_ridge, k_scale=args.k_scale,
@@ -1137,6 +1192,7 @@ def main():
             sys.stdout.write(text)
         return
     out = lite.render(args.image, width=width, ban=ban or None,
+                      color_fg=args.color_fg, bg=args.bg,
                       stride=args.stride, ensemble=args.ensemble,
                       temp=args.temp, color_path=args.color_path,
                       topk_frac=args.topk_frac, topk_weight=args.topk_weight,
@@ -1176,7 +1232,8 @@ def main():
     if args.refine > 0:
         import shlex
         text, out = auto_refine(lite, args.image, out, width, args.refine,
-                                extra=shlex.split(args.refine_args))
+                                extra=shlex.split(args.refine_args),
+                                color_fg=args.color_fg, bg=args.bg, ink_target=args.ink_target)
         # --png / --out-text below ship the refined grid
     if args.refine_legacy > 0:
         sys.stderr.write("== lite ==\n")

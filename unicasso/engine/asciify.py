@@ -1065,6 +1065,26 @@ def parse_args():
                    help="quantize fg/bg to N k-means colors (straight-through). 0 = continuous; "
                         "emission snaps to ANSI regardless")
     p.add_argument("--output-ans", default=None, help="(color) write an ANSI-colored .ans")
+    p.add_argument("--color-fg", action="store_true",
+                   help="FOREGROUND-ONLY colour mode (implies --color): the background is "
+                        "a fixed paper colour (--bg) that is never fitted, the optimizer "
+                        "renders and is judged on that paper, and the .ans carries "
+                        "foreground codes only so the terminal's own background shows "
+                        "through. Coloured line art on white -> coloured ASCII line art")
+    p.add_argument("--bg", default="white", metavar="COLOR",
+                   help="(--color-fg) the paper colour the run renders against: white "
+                        "(default) | black | #rrggbb | auto (median of the image border). "
+                        "Choose the colour of the terminal the art will be shown in")
+    p.add_argument("--ink-target", default="cluster", choices=["cluster", "bg-offset"],
+                   help="(--color-fg) where the STRUCTURE target comes from -- what "
+                        "counts as ink for the reconstruction, the nomination side and "
+                        "the emptiness gate. 'cluster' (default) = decompose's per-cell "
+                        "two-colour clustering, minority colour = ink, as in every "
+                        "--color run. 'bg-offset' = per-pixel distance from the --bg "
+                        "colour: anything that is not paper is ink. No clustering, no "
+                        "per-cell polarity, and a cell fully inside a thick coloured "
+                        "stroke is ink instead of 'flat' -- for line art on a known "
+                        "solid background")
     # NB the --color-lite-* defaults are what `unicasso.lite` ships for the v2
     # models (blend read, ridge 1.0), so `--color-lite CKPT` alone colours the
     # run exactly as the lite model would; the trainer passes them explicitly.
@@ -1449,6 +1469,9 @@ def main():
     # consumer below (empty_safe, pix_fit, cell_ink, tone_gate, tgt_cent, blur_T) then reads unchanged
     # -- that is the whole point of the split: the discrete search never learns about color.
     tgt_rgb = color_dec = None
+    bg_fixed = None
+    if args.color_fg:
+        args.color = True
     if args.color and args.color_pin:
         # PLUMBING CONTROL. Pinning fg/bg alone is not a control: the decomposition target and the
         # RGB recon target would both still differ, so a delta could come from anywhere. Here the
@@ -1468,6 +1491,27 @@ def main():
                                  ramp=args.color_ramp, jnd=args.color_jnd, ratio=args.color_ratio)
         nom = CO.nomination_target(color_dec)                              # (GH*CH, GW*CW) white=1
         target = torch.ones_like(target)
+        if args.color_fg:
+            bg_fixed = CO.parse_bg_color(args.bg, tgt_rgb.cpu()).to(device)
+            print(f"color: --color-fg -> background pinned to --bg {args.bg} "
+                  f"(rgb {tuple(round(float(v), 3) for v in bg_fixed)}); fg only is "
+                  f"fitted, the run renders on that paper, .ans carries fg codes only")
+            if args.ink_target == "bg-offset":
+                # ink = how far each pixel is from the paper, in Lab: 0 at the
+                # JND, saturated at twice the JND. Replaces decompose's minority
+                # cluster as the structure target -- decompose gates a cell to
+                # "flat" when it has no second colour, which for a cell fully
+                # inside a thick stroke is exactly backwards.
+                crop = tgt_rgb[:GH * CH, :GW * CW]
+                lab = CO.srgb_to_lab(crop.reshape(-1, 3))
+                lab_p = CO.srgb_to_lab(bg_fixed.view(1, 3))
+                dist = (lab - lab_p).norm(dim=-1).view(GH * CH, GW * CW)
+                ink_p = ((dist - args.color_jnd) / max(args.color_jnd, 1e-6)).clamp(0, 1)
+                nom = 1.0 - ink_p
+                print(f"color: --ink-target bg-offset -> structure target = distance from the "
+                      f"paper (Lab, jnd {args.color_jnd:g}); mean ink "
+                      f"{float(ink_p.mean()):.3f} vs cluster "
+                      f"{float(color_dec['ink'].mean()):.3f}")
         target[:GH * CH, :GW * CW] = nom
         if args.target_white < 1.0:
             # re-apply the white point to the STRUCTURE map: it was applied to the luminance
@@ -1653,6 +1697,7 @@ def main():
             else:
                 from unicasso.engine.swarm import ParticleSwarm
                 swarm = ParticleSwarm(GH, GW, args.swarm_k, L, device)
+                swarm.bg_fixed = bg_fixed
                 n_seed = swarm.init_from_z0(z0, codebook, empty_safe=empty_safe, space_idx=space_i,
                                             single=args.swarm_init_single)
                 if args.swarm_init_single:
@@ -1931,7 +1976,7 @@ def main():
                                       temp=args.color_lite_temp,
                                       ridge=args.color_lite_ridge),
                             k_scale=args.color_lite_k_scale,
-                            chunk=args.color_lite_chunk)
+                            chunk=args.color_lite_chunk, bg_fixed=bg_fixed)
                         swarm.lite_mode = args.color_lite_mode
                         if args.color_contrast_learn:
                             print("color: NOTE --color-lite -> the learned per-cell "
@@ -3710,7 +3755,8 @@ def main():
                 for j in range(GW):
                     fr, fgn, fb = f8[i, j]
                     br, bg_, bb = b8[i, j]
-                    row.append(f"\x1b[38;2;{fr};{fgn};{fb}m\x1b[48;2;{br};{bg_};{bb}m"
+                    row.append((f"\x1b[38;2;{fr};{fgn};{fb}m" if bg_fixed is not None else
+                                f"\x1b[38;2;{fr};{fgn};{fb}m\x1b[48;2;{br};{bg_};{bb}m")
                                + chars[ig[i, j].item()])
                 fh.write("".join(row) + "\x1b[0m\n")
         print(f"Saved ANSI truecolor -> {ans}")
@@ -3725,7 +3771,12 @@ def main():
                 mk = 1.0 - bm_flat[gi]                                    # (M,P) ink=1
                 tc = tgt_rgb[:GH * CH, :GW * CW].reshape(GH, CH, GW, CW, 3) \
                     .permute(0, 2, 1, 3, 4).reshape(M, CH * CW, 3)
-                rf, rb = fit_fg_bg(tc, mk)
+                if bg_fixed is not None:
+                    from unicasso.engine.color import fit_fg_fixed_bg
+                    rf = fit_fg_fixed_bg(tc, mk, bg_fixed)
+                    rb = bg_fixed.expand_as(rf)
+                else:
+                    rf, rb = fit_fg_bg(tc, mk)
                 if args.recolor_min_contrast > 0:
                     lum = lambda t: 0.299 * t[:, 0] + 0.587 * t[:, 1] + 0.114 * t[:, 2]
                     gap = lum(rf) - lum(rb)
@@ -3735,9 +3786,12 @@ def main():
                     # the refit must carry the learned contrast too, or *_mserefit silently throws
                     # away the thing the tail of the run was spent learning
                     kk_ = swarm.k_contrast.data.clamp(0, swarm.k_contrast_max)[:, None]
-                    mid_ = 0.5 * (rf + rb)
-                    rf = (mid_ + kk_ * (rf - mid_)).clamp(0, 1)
-                    rb = (mid_ + kk_ * (rb - mid_)).clamp(0, 1)
+                    if bg_fixed is not None:
+                        rf = (rb + kk_ * (rf - rb)).clamp(0, 1)
+                    else:
+                        mid_ = 0.5 * (rf + rb)
+                        rf = (mid_ + kk_ * (rf - mid_)).clamp(0, 1)
+                        rb = (mid_ + kk_ * (rb - mid_)).clamp(0, 1)
                 rc = rb[:, None, :] + (rf - rb)[:, None, :] * mk[:, :, None]
                 rout = assemble_rgb(rc.view(1, GH, GW, CH, CW, 3), GH, GW, CH, CW,
                                     args.row_gap, IMG_H, IMG_W)[0]
@@ -3752,7 +3806,9 @@ def main():
                 for i in range(GH):
                     fh.write("".join(
                         f"\x1b[38;2;{rf8[i,j,0]};{rf8[i,j,1]};{rf8[i,j,2]}m"
-                        f"\x1b[48;2;{rb8[i,j,0]};{rb8[i,j,1]};{rb8[i,j,2]}m" + chars[ig[i, j].item()]
+                        + ("" if bg_fixed is not None else
+                           f"\x1b[48;2;{rb8[i,j,0]};{rb8[i,j,1]};{rb8[i,j,2]}m")
+                        + chars[ig[i, j].item()]
                         for j in range(GW)) + "\x1b[0m\n")
             print(f"MSE refit (min-contrast {args.recolor_min_contrast}): "
                   f"residual {res_run:.4f} (run colors) -> {res_fit:.4f} (refit)")

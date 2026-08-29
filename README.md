@@ -99,6 +99,7 @@ Common flags (full list in [`docs/flags.md`](docs/flags.md)):
 | flag | does |
 |---|---|
 | `--color` | 24-bit ANSI output (fg/bg fitted per cell); needs fewer iters |
+| `--color-fg [--bg COLOR]` | foreground-only colour: the background is a fixed paper colour (default `white`; `black`, `#rrggbb`, `auto`) that is never fitted, the run is optimized on that paper, and the `.ans` carries foreground codes only — coloured line art in, coloured ASCII line art out |
 | `--color-lite weights/lite/unicasso-lite-color.pt` | with `--color`: colour every cell the way the distilled v2 model would, instead of the closed-form fit (see [Distilled models](#distilled-models)); pick the file matching the font kit. The learned per-cell contrast `k` is not used in this mode — the colours are exactly the model's |
 | `--base-width N` | grid width in characters (default 60) |
 | `--ban-chars "…"` / `--ban-blocks` / `--ban-letters` | drop glyphs from the charset |
@@ -213,6 +214,7 @@ python -m unicasso.lite photo.jpg -w 60 --png art.png # also save the pixel rend
 python -m unicasso.lite photo.jpg --font sfmono       # the SF Mono kit's models
 python -m unicasso.lite drawing.png --line            # monochrome ASCII art (plain text, no color)
 python -m unicasso.lite photo.jpg --refine 300        # + 300 optimizer iterations (see below)
+python -m unicasso.lite lineart.png --color-fg        # foreground colours only, white paper (--bg)
 ```
 
 Two models per font ship in [`weights/lite/`](weights/lite/): **color** and
@@ -239,9 +241,23 @@ fresh exploration). What happens depends on the model, nothing to configure:
 - **v1 colour model** — the optimizer's closed-form colours.
 
 Below ~300 iterations it likely doesn't help much; a few hundred take
-minutes on an M-series Mac and need the engine's dependencies (`open_clip`). Everything else about the lite CLI is automatic:
-the model is picked by `--font`, and how it is read and coloured is fixed by
-the checkpoint.
+minutes on an M-series Mac and need the engine's dependencies (`open_clip`).
+Everything else about the lite CLI is automatic: the model is picked by
+`--font`, and how it is read and coloured is fixed by the checkpoint.
+
+**Foreground-only colour** (`--color-fg`, both CLIs). A terminal cell always
+has *some* background, so "no background colour" has to mean "a background
+we don't emit": `--bg` names the paper colour (default `white`, or `black`,
+`#rrggbb`, `auto` = the image's border), the foreground colour of every cell
+is fitted against that paper, and the output carries foreground codes only —
+the terminal's own background shows through. The lite models pick their
+glyphs assuming a free background, so on their own the result is mixed; with
+`--refine` the optimizer re-arbitrates the glyphs *on the paper*, in the
+model's colours. The full optimizer (`unicasso --color-fg`) does this from
+the start, with the closed-form colours or `--color-lite`. For line art on a
+solid background add `--ink-target bg-offset`: ink is then "anything that
+isn't the paper colour", per pixel, instead of the per-cell two-colour
+clustering the photo pipeline uses.
 
 **v2 color models.** The v1 color model (0.5 M parameters) fitted two colors
 per cell from a Lab decomposition and scaled their contrast with a learned

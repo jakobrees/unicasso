@@ -92,6 +92,7 @@ class ParticleSwarm:
         # Always detached: nothing differentiates through the lite model.
         self.lite_colorer = None
         self.lite_mode = None
+        self.bg_fixed = None             # (3,) paper colour under --color-fg: bg is never fitted
         self.lite_grid = None            # (M,) current snap: the 'render' ink context
         self._lite_prev_g = None         # (M,K) last forward's slot glyphs
         self.color_bg_dist = None        # (N,P) per-glyph bg-distance table (color.glyph_bg_dist)
@@ -218,6 +219,8 @@ class ParticleSwarm:
                           .argmin(1)].reshape(bg.shape)
             fg = fg + (fq - fg).detach()
             bg = bg + (bq - bg).detach()
+        if self.bg_fixed is not None:
+            bg = self.bg_fixed.to(bg.dtype).expand_as(bg)
         return fg, bg
 
     def set_palette(self, pal):
@@ -266,6 +269,8 @@ class ParticleSwarm:
         k = self.k_contrast
         k = k + (k.clamp(0.0, self.k_contrast_max) - k).detach()      # STE clamp
         kk = k.view(-1, *([1] * (fg.dim() - 1)))
+        if self.bg_fixed is not None:            # paper never moves: scale fg away from it
+            return bg + kk * (fg - bg), bg
         mid = 0.5 * (fg + bg)
         return mid + kk * (fg - mid), mid + kk * (bg - mid)
 
@@ -300,6 +305,16 @@ class ParticleSwarm:
         r = self.color_fit_ridge
         P = ink.shape[-1]
         mean = C.mean(1)                                             # (M,3) degenerate-mask fallback
+        if self.bg_fixed is not None:
+            # --color-fg: the paper is a constant, only fg is a function of the ink
+            from unicasso.engine.color import fit_fg_fixed_bg
+            fg = fit_fg_fixed_bg(C, ink, self.bg_fixed, r)              # (M,K,3)
+            bg = self.bg_fixed.to(fg.dtype).expand_as(fg)
+            fg = self._mc_push(fg, bg)
+            fg, bg = self._apply_k(fg, bg)
+            fg = fg + (fg.clamp(0, 1) - fg).detach()
+            fg, _ = self._quantize(fg, bg)
+            return fg, bg
         sw = ink.sum(-1)                                             # (M,K) ink mass
         num_f = torch.einsum("mkp,mpc->mkc", ink, C)                 # (M,K,3)
         fg = (num_f + r * mean[:, None, :]) / (sw + r).clamp_min(1e-6)[:, :, None]
@@ -344,6 +359,16 @@ class ParticleSwarm:
             cells = torch.arange(gidx.shape[0], device=gidx.device)
             return self.lite_colorer.query(cells, gidx, grid=gidx)
         from unicasso.engine.color import fit_fg_bg
+        if self.bg_fixed is not None:
+            from unicasso.engine.color import fit_fg_fixed_bg, snap_to_palette
+            fg = fit_fg_fixed_bg(self.tgt_cell_rgb, mask, self.bg_fixed, self.color_fit_ridge)
+            bg = self.bg_fixed.to(fg.dtype).expand_as(fg)
+            fg = self._mc_push(fg, bg)
+            fg, bg = self._apply_k(fg, bg)
+            fg = fg.clamp(0, 1)
+            if self.pal is not None:
+                fg, _ = snap_to_palette(fg, self.pal)
+            return fg, bg
         bg_w = None
         if self.color_bg_dist is not None and self.color_bg_dist_pow > 0 and gidx is not None:
             bg_w = self.color_bg_dist[gidx].pow(self.color_bg_dist_pow)

@@ -88,7 +88,10 @@ def orient_ink_dark(dec):
     return dec
 
 
-def ansi_txt(pred, chars, fg, bg, gh, gw):
+def ansi_txt(pred, chars, fg, bg, gh, gw, fg_only=False):
+    """24-bit ANSI. fg_only (--color-fg): foreground codes only, the terminal's
+    own background shows through -- bg is what the colours were fitted against
+    and is not emitted."""
     lines = []
     for y in range(gh):
         parts = []
@@ -96,8 +99,9 @@ def ansi_txt(pred, chars, fg, bg, gh, gw):
             i = y * gw + x
             f = (fg[i] * 255).round().astype(int)
             b = (bg[i] * 255).round().astype(int)
-            parts.append(f"\x1b[38;2;{f[0]};{f[1]};{f[2]}m\x1b[48;2;{b[0]};{b[1]};{b[2]}m"
-                         + chars[pred[y, x]])
+            code = (f"\x1b[38;2;{f[0]};{f[1]};{f[2]}m" if fg_only else
+                    f"\x1b[38;2;{f[0]};{f[1]};{f[2]}m\x1b[48;2;{b[0]};{b[1]};{b[2]}m")
+            parts.append(code + chars[pred[y, x]])
         lines.append("".join(parts) + "\x1b[0m")
     return "\n".join(lines) + "\n"
 
