@@ -34,12 +34,16 @@ def load_model(run_dir, meta, device):
         m = TokenTransformer(rows, cols, meta["cell_h"], meta["cell_w"],
                              meta["pad_h"], meta["pad_w"], N, dim=cfg["dim"],
                              heads=cfg["heads"], n_blocks=cfg.get("blocks", 1),
-                             clip_dim=meta["clip_dim"] if cfg["clip_token"] else 0)
+                             clip_dim=meta["clip_dim"] if cfg["clip_token"] else 0,
+                             in_ch=cfg.get("in_ch", 1))
     else:
         win_h = rows * meta["cell_h"] + 2 * meta["pad_h"]
         win_w = cols * meta["cell_w"] + 2 * meta["pad_w"]
         m = WindowCNN(win_h, win_w, N)
     sd = ck["state_dict"]
+    if is_tf and "mask_dec.out.weight" in sd:
+        from unicasso.training.train_cell_classifier import MaskDecoder
+        m.mask_dec = MaskDecoder(cfg["dim"])
     # checkpoints from before the multi-block refactor kept block weights at top level
     if is_tf and "blocks.0.ln1.weight" not in sd:
         sd = {("blocks.0." + k if k.split(".")[0] in ("ln1", "attn", "ln2", "mlp") else k): v

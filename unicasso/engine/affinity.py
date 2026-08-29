@@ -8,9 +8,15 @@ just biases similar regions toward consistent latents (regularization, smooth, A
 The similarity helpers (cnn_sim/dino_sim/_stretch01/...) live HERE, with no training-side
 imports, so asciify.py can import this cleanly.
 """
+import os
+
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+_PERSIST = {}          # backbone cache, armed only under ASCIIFY_PERSIST=1
+# (persistent E-step workers run many asciify jobs in one process; DINO/RN101
+# reload per job would otherwise dominate short refinement runs)
 
 
 def _cells_from_map(feat, GH, GW):
@@ -43,6 +49,9 @@ def cnn_sim(feat_t, layers, GH, GW, device, max_side=448, clip=None):
     .. layer4 coarse) resampled to cells, per-layer stretched cosine, averaged then re-stretched.
     Pass an existing CLIPPerceptualLoss as `clip` to avoid reloading the backbone."""
     from unicasso.engine.clip_loss import CLIPPerceptualLoss
+    if clip is None and os.environ.get("ASCIIFY_PERSIST"):
+        clip = _PERSIST.setdefault(("rn101", str(device)),
+                                   CLIPPerceptualLoss(device))
     clip = clip if clip is not None else CLIPPerceptualLoss(device)
     maps = clip.dense_features(feat_t, layers=tuple(layers), max_side=max_side,
                                base=True)   # affinity edges describe the TARGET: base path
@@ -54,6 +63,9 @@ def dino_sim(feat_t, GH, GW, device, model_name="vit_base_patch16_dinov3.lvd1689
     """DINOv3 patch-token similarity (semantic correspondence). Pass an existing DINOPerceptualLoss
     as `dino` to avoid reloading the backbone."""
     from unicasso.engine.dino_loss import DINOPerceptualLoss
+    if dino is None and os.environ.get("ASCIIFY_PERSIST"):
+        dino = _PERSIST.setdefault(("dino", model_name, str(device)),
+                                   DINOPerceptualLoss(device, model_name=model_name))
     dino = dino if dino is not None else DINOPerceptualLoss(device, model_name=model_name)
     tok, ph, pw = dino.dense_tokens(feat_t)                # (P,C)
     feat = tok.t().reshape(tok.shape[1], ph, pw)           # (C,ph,pw)

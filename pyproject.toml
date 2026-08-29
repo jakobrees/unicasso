@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unicasso"
-version = "0.1.0"
+version = "0.5.0"
 description = "Image-to-ASCII art by direct optimization: CLIP-driven search over a glyph-VAE latent space, any monospace font, optional color."
 readme = "README.md"
 license = { file = "LICENSE" }

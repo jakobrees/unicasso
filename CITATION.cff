@@ -7,7 +7,7 @@ authors:
     given-names: Jakob Moritz
 repository-code: "https://github.com/jakobrees/unicasso"
 license: MIT
-version: 0.1.0
+version: 0.5.0
 date-released: 2026-08-10
 keywords:
   - ascii-art

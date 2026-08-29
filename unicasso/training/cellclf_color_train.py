@@ -43,7 +43,8 @@ from unicasso.engine.color import decompose, nomination_target
 from unicasso.training.cellclf_color import fit_fg_bg_distweighted, glyph_bg_dist
 from unicasso.training.train_cell_classifier import (
     CellCache, MuonWithAdamW, SynthRenderer, TokenTransformer, binomial_kernel,
-    evaluate, eval_clip_render, grad_norm_of, kernel_ce, split_muon_params)
+    blur_img, corrupt_color_batch, evaluate, eval_clip_render, grad_norm_of,
+    kernel_ce, split_muon_params)
 from unicasso.training.cellclf_widths import discover_models, load_any
 
 FEAT_DIM = 11
@@ -57,11 +58,16 @@ def cell_feats(dec):
                       dec["fg"], dec["bg"], mean], dim=1).float()
 
 
-def grid_windows(img, gh, gw, ch, cw, ph, pw, rows=3, cols=5, pad_val=0):
-    """All cells' windows of a standalone grid. img (H,W) or (H,W,3) numpy."""
+def grid_windows(img, gh, gw, ch, cw, ph, pw, rows=3, cols=5, pad_val=0,
+                 edge=False):
+    """All cells' windows of a standalone grid. img (H,W) or (H,W,3) numpy.
+    edge=True: replicate border pixels instead of a constant -- REQUIRED for
+    RGB windows feeding margin fits (constant white pads would vote phantom
+    white into boundary cells' colors)."""
     py, px = (rows // 2) * ch + ph, (cols // 2) * cw + pw
     pw_spec = ((py, py), (px, px)) + (((0, 0),) if img.ndim == 3 else ())
-    pad = np.pad(img, pw_spec, constant_values=pad_val)
+    pad = np.pad(img, pw_spec, mode="edge") if edge else \
+        np.pad(img, pw_spec, constant_values=pad_val)
     wh, ww = rows * ch + 2 * ph, cols * cw + 2 * pw
     shape = (gh * gw, wh, ww) + ((3,) if img.ndim == 3 else ())
     out = np.empty(shape, img.dtype)
@@ -72,6 +78,31 @@ def grid_windows(img, gh, gw, ch, cw, ph, pw, rows=3, cols=5, pad_val=0):
             l = px + x * cw - (cols // 2) * cw - pw
             out[i] = pad[t:t + wh, l:l + ww]; i += 1
     return out
+
+
+def grid_windows_t(img, gh, gw, ch, cw, ph, pw, rows=3, cols=5, pad_val=0.0,
+                   edge=False):
+    """`grid_windows` for a TENSOR, on whatever device it already lives on.
+
+    Same padding and same window origins, so the result is elementwise identical
+    to the numpy version -- verified, not assumed. Exists because the photo arm's
+    decompose now runs on the GPU: pulling the ink map back to host just to slice
+    it in a 700-iteration Python loop would cost the copy AND force a stream sync
+    in the middle of the step, which is exactly the serialisation that stops one
+    photo's host work from overlapping the previous photo's GPU work.
+
+    img (H,W) or (H,W,3) -> (gh*gw, wh, ww) or (gh*gw, wh, ww, 3)."""
+    py, px = (rows // 2) * ch + ph, (cols // 2) * cw + pw
+    wh, ww = rows * ch + 2 * ph, cols * cw + 2 * pw
+    hw3 = img.dim() == 3
+    x = (img.permute(2, 0, 1) if hw3 else img[None])[None]           # (1,C,H,W)
+    x = (F.pad(x, (px, px, py, py), mode="replicate") if edge else
+         F.pad(x, (px, px, py, py), mode="constant", value=pad_val))
+    # window (y,x) starts at (y*ch, x*cw) in the PADDED image, so a strided
+    # unfold lands on exactly the origins the numpy loop walks
+    u = x.unfold(2, wh, ch).unfold(3, ww, cw)                    # (1,C,gh,gw,wh,ww)
+    u = u.reshape(x.shape[1], gh * gw, wh, ww)
+    return u.permute(1, 2, 3, 0) if hw3 else u[0]
 
 
 def token_maps(gh, gw, rows, cols):
@@ -110,6 +141,97 @@ def parse_ans(path):
             rows.append(cells)
     gw = max(len(r) for r in rows)
     return [r + [(" ", (0, 0, 0), (0, 0, 0))] * (gw - len(r)) for r in rows]
+
+
+def expand_conv_in(model):
+    """in_ch 1 -> 4 conv surgery: old weights verbatim on the ink channel
+    (channel 0), RGB channels zero. Step 0 is bit-identical to the 1-ch model:
+    the _embed shim feeds [ink, visual-RGB] and the zero RGB weights ignore
+    the new channels until gradients ask otherwise."""
+    c0 = model.trunk[0]
+    new = nn.Conv2d(4, c0.out_channels, c0.kernel_size[0],
+                    c0.stride[0], c0.padding[0])
+    with torch.no_grad():
+        new.weight.zero_()
+        new.weight[:, :1].copy_(c0.weight)
+        new.bias.copy_(c0.bias)
+    model.trunk[0] = new.to(c0.weight.device)
+    model.in_ch = 4
+
+
+def mask_fit(pm, C, ridge=1.0):
+    """Mask-weighted closed-form colors. pm (M,K>=2,ch,cw) per-pixel probs
+    (channel 0 = fg, 1 = bg; already core-cropped and softmaxed); C (M,P,3)
+    cell pixels. The ridge (in pixel-mass units) pulls a low-mass layer toward
+    the plain cell mean -- empty cells and all-abstain cells stay finite."""
+    M = pm.shape[0]
+    mean = C.mean(1)
+    pf = pm[:, 0].reshape(M, -1)
+    pb = pm[:, 1].reshape(M, -1)
+    fg = ((pf[..., None] * C).sum(1) + ridge * mean) \
+        / (pf.sum(1, keepdim=True) + ridge)
+    bg = ((pb[..., None] * C).sum(1) + ridge * mean) \
+        / (pb.sum(1, keepdim=True) + ridge)
+    return fg, bg
+
+
+def vote_pix(mlog, t):
+    """Per-pixel WRONG-VOTE penalty (class dim -3): fg mass on bg pixels, bg
+    mass on fg pixels, committed mass on corrupted pixels. ABSTAIN IS FREE on
+    real pixels -- the color-recovery loss decides how much mass the fit
+    actually needs, so the mask may stay agnostic wherever the colors still
+    come out right (flexibility, not forced per-pixel commitment)."""
+    p = mlog.softmax(-3).clamp(1e-6, 1 - 1e-6)
+    tf_, tb_, ta_ = t.unbind(-3)
+    pf, pb, pa = p.unbind(-3)
+    return -(tf_ * torch.log1p(-pb) + tb_ * torch.log1p(-pf) + ta_ * pa.log())
+
+
+def plain_pix(mlog, t):
+    """Per-pixel PLAIN CE (class dim -3): forced commitment to the target
+    distribution -- the bootstrap form."""
+    return -(t * F.log_softmax(mlog, dim=-3)).sum(-3)
+
+
+def mask_kernel_ce(mlog_core, tgt, ids_t, valid_t, kernel, form="plain"):
+    """Dense per-window-cell mask loss, binomial-kernel weighted like
+    kernel_ce. form: 'plain' (forced commitment) or 'vote' (wrong-vote only,
+    abstain free -- see vote_pix). mlog_core (B,T,3,ch,cw) logits (core-
+    cropped); tgt (M,3,ch,cw) soft targets; ids_t/valid_t (B,T)."""
+    fn = plain_pix if form == "plain" else vote_pix
+    ce = fn(mlog_core, tgt[ids_t]).mean((-1, -2))          # (B,T)
+    w = kernel[None, :] * valid_t.float()
+    return (ce * w).sum() / w.sum().clamp_min(1e-8)
+
+
+def paint_glints(ink_img, fgc, bgc, rng, n_max=3):
+    """CONTENT counter-class to the corruptions: recolor short OPAQUE segments
+    of the stroke itself (disc ∩ ink) in a third color. Returns (rgb (H,W,3),
+    Fmap (H,W,3) per-pixel fg color). The targets DON'T change -- glint pixels
+    are still the stroke, so the mask must KEEP them as fg; only the per-cell
+    true fg color moves, which the per-cell fit represents natively. This is
+    the earring case, synthesized: anomalous color ON the stroke = keep;
+    anomalous color NEAR the stroke (corruptions) = abstain. Cues that
+    transfer: on-strokeness and opacity."""
+    H, W = ink_img.shape
+    Fmap = fgc.view(1, 1, 3).expand(H, W, 3).clone()
+    n = int(rng.integers(0, n_max + 1))
+    pts = torch.nonzero(ink_img > 0.3)
+    if n and len(pts):
+        yy = torch.arange(H).view(H, 1).float()
+        xx = torch.arange(W).view(1, W).float()
+        for _ in range(n):
+            cy, cx = pts[int(rng.integers(len(pts)))].tolist()
+            r = 4.0 + rng.random() * 10.0
+            gc = torch.from_numpy(rng.random(3).astype(np.float32))
+            if float((gc - bgc).norm()) < 0.25:      # never bg-invisible ink
+                gc = (gc + 0.5) % 1.0
+            if float((gc - fgc).norm()) < 0.25:      # and never a non-anomaly
+                gc = (gc + torch.tensor([0.33, -0.33, 0.5])) % 1.0
+            m = ((yy - cy) ** 2 + (xx - cx) ** 2) <= r * r
+            Fmap[m] = gc
+    rgb = bgc + (Fmap - bgc) * ink_img[..., None]
+    return rgb, Fmap
 
 
 def main():
@@ -182,6 +304,14 @@ def main():
                         "k regime carries equal gradient mass, GATED by displacement "
                         "min(disp/0.05, 1) so rare-k-but-invisible noise cells stay muted")
     p.add_argument("--k-balance-cap", type=float, default=10.0)
+    p.add_argument("--ans-k-scale", type=float, default=1.0,
+                   help="scale on the ans-target K regression (glyph CE keeps "
+                        "full weight regardless). The stored k values are "
+                        "calibrated around the OLD blend-fit midpoint; in the "
+                        "mask world k stacks on the mask-fit midpoint, which "
+                        "already reaches speculars natively -- so for mask "
+                        "models run this small (~0.25) as a stabilizer, or 0 "
+                        "once the EM pool carries the color signal")
     p.add_argument("--k-dev-weight", type=float, default=1.0,
                    help="k-loss weight scale ~ |k-1|*||base deviation|| (displacement): "
                         "emphasizes cells whose contrast intent is large in COLOR units, "
@@ -189,6 +319,120 @@ def main():
     p.add_argument("--photo-color-aux", type=float, default=0.0,
                    help="MSE weight tying col_head to the closed-form blend fg/bg on "
                         "photo steps (unscaled by lambda; 0 = the shipped v1 recipe)")
+    p.add_argument("--mask-dec", action="store_true",
+                   help="mask model: expand the input conv to 4ch (ink verbatim, "
+                        "RGB zero) and attach the MaskDecoder (per-pixel fg/bg/"
+                        "abstain softmax). Adds the colored-lineart bootstrap arm "
+                        "and colored-corruption supervision to coltext")
+    p.add_argument("--mask-frac", type=float, default=0.2,
+                   help="fraction of steps drawn as colored-lineart mask steps")
+    p.add_argument("--mask-ce-weight", type=float, default=1.0,
+                   help="dense per-pixel mask CE weight (bootstrap tasks)")
+    p.add_argument("--mask-color-weight", type=float, default=1.0,
+                   help="MSE weight: mask-fit colors must recover the TRUE fg/bg "
+                        "through the corruption (the navigate-around-junk signal)")
+    p.add_argument("--mask-only", action="store_true",
+                   help="MASK-ONLY CLIP PHASE: freeze everything except the "
+                        "mask decoder and make every step a refT mask step "
+                        "(pinned glyphs, CLIP at fixed weight 1 + pseudo-CE + "
+                        "penalties). The whole gradient budget lands on the "
+                        "one module being taught -- the focused bootstrap/"
+                        "falsification test")
+    p.add_argument("--mask-margin-fit", action="store_true",
+                   help="fit colors over the FULL PATCH (cell + margins) with "
+                        "the un-cropped mask: a cell may borrow pixels from "
+                        "its neighbors (the earring sliver pulls gold from "
+                        "next door). Pseudo-targets extend to margin pixels "
+                        "via the CENTER cell's refined colors. Stamped into "
+                        "cfg so lite deploys identically")
+    p.add_argument("--mask-pseudo-weight", type=float, default=1.0,
+                   help="plain-CE toward PSEUDO-MASKS derived from the "
+                        "E-step's engine-REFINED colors: each photo pixel is "
+                        "assigned to the nearer of (fg_ref, bg_ref); cells "
+                        "gated by refined-color separation. Dense, photo-"
+                        "pixel-derived supervision -- breaks the glyph-ink "
+                        "echo and bypasses softmax saturation")
+    p.add_argument("--mask-temp", type=float, default=1.0,
+                   help="softmax temperature on MASK LOGITS in training arms "
+                        "(deploy stays 1). T>1 de-saturates the probabilities "
+                        "AND fattens the softmax Jacobian -- the render-side "
+                        "losses (CLIP/fit/penalties) regain traction on hard-"
+                        "committed pixels, which noise at any placement cannot "
+                        "give (CE losses need no help: their (p-target) "
+                        "gradient never vanishes). The orchestrator anneals "
+                        "T -> 1")
+    p.add_argument("--mask-logit-noise", type=float, default=0.0,
+                   help="sigma of Gaussian noise on MASK LOGITS (pre-softmax) "
+                        "in the refT and photo arms -- reparameterized "
+                        "exploration for saturation escape: a hard-committed "
+                        "pixel (p~0.99) passes almost no CLIP gradient; noise "
+                        "lets the loss feel nearby assignments and pull pixels "
+                        "across the boundary. Training arms only, bootstrap "
+                        "arms excluded (dense targets need no exploration). "
+                        "0 = off; the orchestrator anneals it")
+    p.add_argument("--mask-color-blend", type=float, default=1.0,
+                   help="refT render colors = (1-b)*closed-form + b*mask-fit "
+                        "(closed-form detached). b<1 keeps CLIP judging sane "
+                        "colors while the masks earn influence through their "
+                        "share; the EM orchestrator anneals b -> 1")
+    p.add_argument("--mask-color-target", type=float, default=0.0,
+                   help="MSE pulling the mask-fit colors toward the closed-"
+                        "form fit (visible cells for fg). A bootstrap "
+                        "attractor -- the orchestrator anneals it to 0 so the "
+                        "masks may eventually beat the closed form")
+    p.add_argument("--mask-bootstrap", default="plain",
+                   choices=["plain", "vote"],
+                   help="loss form for the colorart/coltext mask CE: 'plain' "
+                        "= forced per-pixel commitment (bootstrap default -- "
+                        "the free-abstain equilibrium drained fg mass), "
+                        "'vote' = wrong-vote only (abstain free)")
+    p.add_argument("--mask-sep-floor", type=float, default=0.1,
+                   help="minimum mask-fit fg/bg separation demanded wherever "
+                        "the model places a VISIBLE glyph: penalty (1-p_space)"
+                        "*relu(floor - |fg-bg|). Escaping via the space glyph "
+                        "is always allowed -- either separate your colors or "
+                        "admit the cell is empty")
+    p.add_argument("--mask-sep-floor-weight", type=float, default=1.0)
+    p.add_argument("--mask-structure-weight", type=float, default=0.5,
+                   help="cells decompose CERTIFIES as two-colored (gate) must "
+                        "fit at least --mask-structure-frac of decompose's own "
+                        "separation: gate*relu(frac*d_dec - d_mask). The "
+                        "direct punishment for the measured mush")
+    p.add_argument("--mask-structure-frac", type=float, default=0.5)
+    p.add_argument("--mask-photo-prior", type=float, default=0.0,
+                   help="photo steps: weak plain-CE attractor pulling the fg "
+                        "mask toward the decompose ink map (bg toward its "
+                        "complement). The POSITIVE pressure the wrong-vote "
+                        "loss deliberately lacks -- without it the free-abstain "
+                        "equilibrium drains fg mass on photos (measured: 0.19->"
+                        "0.03 over 7 EM rounds). Low weight (~0.3): seeds "
+                        "figure/ground, CLIP refines. 0 = off")
+    p.add_argument("--mask-abstain-prior", type=float, default=0.01,
+                   help="mean-abstain prior against global abstain drift")
+    p.add_argument("--coltext-corrupt", type=float, default=0.7,
+                   help="probability a coltext batch gets colored corruptions "
+                        "(+ mask supervision); masks on only")
+    p.add_argument("--refined-pool", default="",
+                   help="dir of E-step refined targets (<name>.npz: glyphs/photo/"
+                        "width/round). Orchestrator manages TTL by deleting "
+                        "expired entries; the trainer trains on whatever is there")
+    p.add_argument("--refined-frac", type=float, default=0.25,
+                   help="fraction of steps drawn as refined-pool steps")
+    p.add_argument("--refined-scatter", type=int, default=4,
+                   help="entries per refined step for the scattered glyph-CE part")
+    p.add_argument("--refined-lineart-frac", type=float, default=0.0,
+                   help="within a refined step, probability of the LINEART arm "
+                        "(ink-only glyph CE on '.ln' pool entries) vs the color arm")
+    p.add_argument("--mask-clip", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="refined steps: CLIP judges the render built from the "
+                        "model's own mask-fit colors on the PINNED glyphs "
+                        "(colorize mode) -- the masks' only photo-domain signal")
+    p.add_argument("--mask-blur-anchor", type=float, default=0.05,
+                   help="tone-mass anchor: MSE between cell-width-sigma blurs of "
+                        "the mask-colored render and the photo crop (unscaled)")
+    p.add_argument("--mask-k", action=argparse.BooleanOptionalAction, default=True,
+                   help="apply k_hat on top of mask-fit colors in colorize renders")
     p.add_argument("--eval-every", type=int, default=100)
     p.add_argument("--eval-cells", type=int, default=40000)
     p.add_argument("--holdout-parents", default="00094,00177")
@@ -220,6 +464,8 @@ def main():
     init_ck_path = None
     if not scratch:
         entry = dict(discover_models()).get(args.init)
+        if entry is None and os.path.exists(G.repo_path(args.init)):
+            entry = G.repo_path(args.init)     # raw ckpt path (EM rounds)
         if entry is not None:
             probe = torch.load(entry if isinstance(entry, str) else entry,
                                map_location="cpu", weights_only=False)
@@ -246,14 +492,20 @@ def main():
         if cfg.get("feat_dim", 0):
             model.color_proj = nn.Linear(cfg["feat_dim"], dim0)
         if "mode_emb" in sd0:
-            model.mode_emb = nn.Parameter(torch.zeros(2, dim0))
+            model.mode_emb = nn.Parameter(
+                torch.zeros(sd0["mode_emb"].shape[0], dim0))
         model.k_head = nn.Linear(dim0, 1)
         model.col_head = nn.Linear(dim0, 6)
+        if "mask_dec.out.weight" in sd0:
+            from unicasso.training.train_cell_classifier import MaskDecoder
+            model.mask_dec = MaskDecoder(dim0)
         model.load_state_dict(sd0)
         model = model.to(device).train()
         print(f"  continued from color model {args.init}", flush=True)
     else:
-        model, cfg = load_any(dict(discover_models())[args.init], meta, device)
+        model, cfg = load_any(entry if entry is not None
+                              else dict(discover_models())[args.init],
+                              meta, device)
         model.train()
         if use_tok and not getattr(model, "use_clip", False):
             dim = model.pos.shape[1]
@@ -277,7 +529,32 @@ def main():
         nn.init.zeros_(model.k_head.weight); nn.init.zeros_(model.k_head.bias)
         model.col_head = nn.Linear(dim, 6).to(device)
         nn.init.zeros_(model.col_head.weight); nn.init.zeros_(model.col_head.bias)
+    if args.mask_dec and getattr(model, "mask_dec", None) is None:
+        from unicasso.training.train_cell_classifier import MaskDecoder
+        if getattr(model, "in_ch", 1) == 1:
+            expand_conv_in(model)                    # 4ch: ink verbatim, RGB zero
+        model.mask_dec = MaskDecoder(dim).to(device)
+        # colorize mode (2) needs a third mode row; grow zero-init, keep old rows
+        me = getattr(model, "mode_emb", None)
+        if me is None or me.shape[0] < 3:
+            new_me = torch.zeros(3, dim, device=device)
+            if me is not None:
+                new_me[:me.shape[0]] = me.data
+            model.mode_emb = nn.Parameter(new_me)
+    masks_on = getattr(model, "mask_dec", None) is not None
+    if args.mask_only:
+        assert masks_on and args.refined_pool, "--mask-only needs --mask-dec + --refined-pool"
+        for p_ in model.parameters():
+            p_.requires_grad_(False)
+        for p_ in model.mask_dec.parameters():
+            p_.requires_grad_(True)
+        print("  MASK-ONLY phase: all modules frozen except mask_dec "
+              f"({sum(q.numel() for q in model.mask_dec.parameters())} params)",
+              flush=True)
     cfg = dict(cfg, color_model=True,
+               mask_margin_fit=bool(args.mask_margin_fit
+                                    or cfg.get("mask_margin_fit")),
+               in_ch=getattr(model, "in_ch", 1), mask_dec=masks_on,
                feat_dim=0 if scratch else cfg.get("feat_dim", FEAT_DIM) or FEAT_DIM,
                arch=args.arch, profile=args.profile,
                align_blend=args.align_blend,
@@ -458,8 +735,18 @@ def main():
             to.append(t[:, model.center])
         return torch.cat(lo), torch.cat(to)
 
-    def photo_region():
-        path = photos[int(rng.integers(len(photos)))]
+    def photo_region(_tries=5):
+        # a corrupt/truncated photo resamples LOUDLY instead of killing the run
+        for _ in range(_tries):
+            path = photos[int(rng.integers(len(photos)))]
+            try:
+                return _photo_region_at(path)
+            except OSError as e:
+                print(f"  [photo] unreadable {os.path.basename(path)}: "
+                      f"{e}; resampling", flush=True)
+        raise RuntimeError(f"photo_region: {_tries} consecutive unreadable photos")
+
+    def _photo_region_at(path):
         W = int(rng.integers(28, 45))
         gh = int(rng.integers(14, args.region_rows + 1))
         with Image.open(path) as im:
@@ -484,8 +771,8 @@ def main():
         """x (M,C,wh,ww), feats_tok or None, ids/valid tensors."""
         w = grid_windows(ink_u8, gh, gw, ch, cw, ph, pw)
         x = torch.from_numpy(w).to(device).float().div_(255).unsqueeze(1)
-        if scratch:
-            cwin = grid_windows(rgb.numpy(), gh, gw, ch, cw, ph, pw, pad_val=1.0)
+        if scratch or getattr(model, "in_ch", 1) == 4:
+            cwin = grid_windows(rgb.numpy(), gh, gw, ch, cw, ph, pw, edge=True)
             xc = torch.from_numpy(cwin).to(device).permute(0, 3, 1, 2)
             x = torch.cat([x, xc], dim=1)
         ids, valid = token_maps(gh, gw, rows, cols)
@@ -506,6 +793,326 @@ def main():
                        (probs * wtok[:, :, None]).reshape(-1, N))
         wsum.index_add_(0, ids_t.reshape(-1), wtok.reshape(-1))
         return acc / wsum[:, None].clamp_min(1e-8)
+
+    tci = (rows // 2) * cols + cols // 2         # center CELL token (no n_extra)
+    in4 = getattr(model, "in_ch", 1) == 4
+
+    def forward_region_masks(x, feats_tok, mode, emb):
+        """Chunked forward that also decodes masks for every window cell.
+        -> (logits (M,T,N), center tokens (M,dim), mask logits (M,T,3,th,tw))."""
+        lo, to, mo = [], [], []
+        for i in range(0, x.shape[0], args.chunk):
+            n = x[i:i + args.chunk].shape[0]
+            e = emb[None].expand(n, -1) if emb is not None else None
+            t, s1 = model._tokens(x[i:i + args.chunk], e,
+                                  feats_tok[i:i + args.chunk]
+                                  if feats_tok is not None else None, mode,
+                                  want_skip=True)
+            lo.append(model.head(t[:, model.n_extra:]))
+            to.append(t[:, model.center])
+            mo.append(model.mask_logits(t, s1))
+        return torch.cat(lo), torch.cat(to), torch.cat(mo)
+
+    def unfold_cores(img, C_):
+        """(B,C,H,W) window batch -> per-cell core patches (B,T,C_,ch,cw)."""
+        th_, tw_ = ch + 2 * ph, cw + 2 * pw
+        p = img.unfold(2, th_, ch).unfold(3, tw_, cw)
+        p = p.reshape(img.shape[0], C_, rows * cols, th_, tw_).permute(0, 2, 1, 3, 4)
+        return p[..., ph:ph + ch, pw:pw + cw]
+
+    def fit_color_loss(pm_core, C, fg_true, bg_true, inkm):
+        """Mask-fit colors must recover the TRUE fg/bg despite corruption.
+        A layer that is barely observed in a cell cannot be recovered from it:
+        fg error is gated by ink mass, bg error by its complement."""
+        fgf, bgf = mask_fit(pm_core, C)
+        wf = (inkm / 0.05).clamp(max=1.0)
+        wb = ((1.0 - inkm) / 0.05).clamp(max=1.0)
+        lf = (wf * (fgf - fg_true).pow(2).mean(-1)).sum() / wf.sum().clamp_min(1e-6)
+        lb = (wb * (bgf - bg_true).pow(2).mean(-1)).sum() / wb.sum().clamp_min(1e-6)
+        return lf + lb
+
+    def colorart_region():
+        """Colored-lineart mask bootstrap: rebuild a lineart region from cached
+        window cores, colorize it fg-on-bg, corrupt it in color space, and run
+        the HONEST deploy path (decompose of the corrupted image). Dense
+        supervision: glyph CE (labels unchanged -- the art under the paint is
+        the same), per-pixel mask CE (fg=clean ink, bg=complement, abstain=
+        corruption alpha), and mask-fit color recovery of the true palette."""
+        ri = train_runs[int(rng.integers(len(train_runs)))]
+        gh0, gw0 = cache.labels[ri].shape
+        rh0 = min(gh0, int(rng.integers(10, 17)))
+        cw0 = min(gw0, int(rng.integers(20, 33)))
+        top = int(rng.integers(0, gh0 - rh0 + 1))
+        left = int(rng.integers(0, gw0 - cw0 + 1))
+        ys, xs = np.mgrid[top:top + rh0, left:left + cw0]
+        idx = np.stack([np.full(rh0 * cw0, ri), ys.ravel(), xs.ravel()],
+                       axis=1).astype(np.int32)
+        w, lab, _, _ = cache.fetch(idx)
+        cores = w[:, ch + ph:2 * ch + ph, 2 * cw + pw:3 * cw + pw]  # (M,ch,cw)
+        M = rh0 * cw0
+        ink_img = torch.from_numpy(cores.astype(np.float32) / 255.0) \
+            .view(rh0, cw0, ch, cw).permute(0, 2, 1, 3) \
+            .reshape(rh0 * ch, cw0 * cw)
+        fgc = torch.from_numpy(rng.random(3).astype(np.float32))
+        bgc = torch.from_numpy(rng.random(3).astype(np.float32))
+        if float((fgc - bgc).norm()) < 0.25:
+            bgc = (bgc + 0.5) % 1.0
+        rgb, Fmap = paint_glints(ink_img, fgc, bgc, rng)            # (H,W,3)
+        out, calpha = corrupt_color_batch(rgb.permute(2, 0, 1)[None], rng,
+                                          ink=ink_img[None])
+        rgb_c, calpha = out[0].permute(1, 2, 0), calpha[0]
+        dec = decompose(rgb_c, rh0, cw0, ch, cw)
+        ink_u8 = np.clip((1.0 - nomination_target(dec).numpy()) * 255.0,
+                         0, 255).astype(np.uint8)
+        x, feats_tok, ids_t, valid_t = region_inputs(rgb_c, dec, ink_u8,
+                                                     rh0, cw0)
+        emb = zero_emb if use_tok else None
+        logits, ct, mlog = forward_region_masks(x, feats_tok, 1, emb)
+        y = torch.from_numpy(lab).to(device)
+        ce = kernel_ce(logits, y, kernel, ce_w)
+        tf_c = ink_img.view(rh0, ch, cw0, cw).permute(0, 2, 1, 3) \
+            .reshape(M, ch, cw)
+        # per-cell TRUE fg color: ink-weighted mean of the painted fg map
+        # (glint cells' truth = the glint color; the fit must reach it)
+        Fc = Fmap.view(rh0, ch, cw0, cw, 3).permute(0, 2, 1, 3, 4) \
+            .reshape(M, ch * cw, 3)
+        tfl = tf_c.reshape(M, -1)
+        mass = tfl.sum(1, keepdim=True)
+        fg_true = (tfl[..., None] * Fc).sum(1) / mass.clamp_min(1e-6)
+        fg_true = torch.where(mass > 1e-4, fg_true, fgc[None].expand(M, 3))
+        tf = tf_c.to(device)
+        ta = calpha.view(rh0, ch, cw0, cw).permute(0, 2, 1, 3) \
+            .reshape(M, ch, cw).to(device)
+        tgt = torch.stack([tf * (1 - ta), (1 - tf) * (1 - ta), ta], dim=1)
+        mcore = mlog[:, :, :, ph:ph + ch, pw:pw + cw]
+        mce = mask_kernel_ce(mcore, tgt, ids_t, valid_t, kernel,
+                             form=args.mask_bootstrap)
+        pm = mcore[:, tci].softmax(1)               # own-window center masks
+        C = dec["cell_rgb"].to(device)
+        lcol = fit_color_loss(pm, C, fg_true.to(device),
+                              bgc.to(device)[None], tf.mean((1, 2)))
+        pa = pm[:, 2].mean()
+        return (ce + args.mask_ce_weight * mce + args.mask_color_weight * lcol
+                + args.mask_abstain_prior * pa)
+
+    # ---- refined-pool arm (E-step targets; orchestrator manages TTL) ----
+    ref_dir = G.repo_path(args.refined_pool) if args.refined_pool else None
+    ref_cache = {}
+
+    def load_refined(f):
+        st = os.stat(f).st_mtime
+        ent = ref_cache.get(f)
+        if ent is not None and ent["mtime"] == st:
+            return ent
+        z = np.load(f, allow_pickle=True)
+        g = torch.from_numpy(np.asarray(z["glyphs"]).astype(np.int64))
+        gh_r, gw_r = g.shape
+        photo = str(z["photo"])
+        with Image.open(photo) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB") \
+                .resize((gw_r * cw, gh_r * ch), Image.LANCZOS)
+        rgb = torch.from_numpy(np.asarray(im, np.float32) / 255.0)
+        dec = decompose(rgb, gh_r, gw_r, ch, cw)
+        ink_u8 = np.clip((1.0 - nomination_target(dec).numpy()) * 255.0,
+                         0, 255).astype(np.uint8)
+        ids_r, valid_r = token_maps(gh_r, gw_r, rows, cols)
+        fg_ref = bg_ref = None
+        if "fg" in z.files:
+            fg_ref = torch.from_numpy(np.asarray(z["fg"], np.float32) / 255.0) \
+                .reshape(-1, 3)
+            bg_ref = torch.from_numpy(np.asarray(z["bg"], np.float32) / 255.0) \
+                .reshape(-1, 3)
+        ent = dict(mtime=st, fg_ref=fg_ref, bg_ref=bg_ref,
+                   glyphs=g.reshape(-1), gh=gh_r, gw=gw_r, rgb=rgb,
+                   feats=cell_feats(dec), cell_rgb=dec["cell_rgb"],
+                   win_ink=grid_windows(ink_u8, gh_r, gw_r, ch, cw, ph, pw),
+                   win_rgb=grid_windows(rgb.numpy(), gh_r, gw_r, ch, cw, ph, pw,
+                                        edge=True),
+                   ids=torch.from_numpy(ids_r), valid=torch.from_numpy(valid_r))
+        if len(ref_cache) >= 40:                     # bounded prep cache
+            ref_cache.pop(next(iter(ref_cache)))
+        ref_cache[f] = ent
+        return ent
+
+    def refined_scatter_ce(files):
+        """Scattered glyph CE: window sub-batches spread across pool entries."""
+        picks = rng.choice(len(files), size=min(args.refined_scatter, len(files)),
+                           replace=False)
+        nsub = max(16, args.batch // max(1, len(picks)))
+        xs, fts, yas = [], [], []
+        for pi in picks:
+            ent = load_refined(files[int(pi)])
+            M = ent["gh"] * ent["gw"]
+            sel = rng.choice(M, size=min(nsub, M), replace=False)
+            xi = torch.from_numpy(ent["win_ink"][sel]).float().div_(255) \
+                .unsqueeze(1)
+            xci = torch.from_numpy(ent["win_rgb"][sel]).permute(0, 3, 1, 2)
+            ids_s, val_s = ent["ids"][sel], ent["valid"][sel]
+            xs.append(torch.cat([xi, xci], dim=1) if in4
+                      else xi)
+            fts.append(ent["feats"][ids_s] * val_s[:, :, None].float())
+            yas.append(torch.where(val_s, ent["glyphs"][ids_s],
+                                   torch.full_like(ids_s, -1)))
+        x = torch.cat(xs).to(device)
+        ft = torch.cat(fts).to(device) if not scratch else None
+        ya = torch.cat(yas).to(device)
+        emb = zero_emb if use_tok else None
+        logits, _ = forward_region(x, ft, 1, emb)
+        return kernel_ce(logits, ya, kernel, ce_w)
+
+    def refined_lineart_ce(files):
+        """Glyph CE on LINEART pool entries: ink-only input (rgb dropped),
+        graded like lineart_region. Self-distills the engine's refined glyphs on
+        lineart -- the color pool's monochrome twin."""
+        picks = rng.choice(len(files), size=min(args.refined_scatter, len(files)),
+                           replace=False)
+        nsub = max(16, args.batch // max(1, len(picks)))
+        xs, yas = [], []
+        for pi in picks:
+            ent = load_refined(files[int(pi)])
+            M = ent["gh"] * ent["gw"]
+            sel = rng.choice(M, size=min(nsub, M), replace=False)
+            xi = torch.from_numpy(ent["win_ink"][sel]).float().div_(255) \
+                .unsqueeze(1)                        # (n,1,ph,pw) INK ONLY
+            ids_s, val_s = ent["ids"][sel], ent["valid"][sel]
+            xs.append(xi)
+            yas.append(torch.where(val_s, ent["glyphs"][ids_s],
+                                   torch.full_like(ids_s, -1)))
+        x = torch.cat(xs).to(device)
+        ya = torch.cat(yas).to(device)
+        emb = zero_emb if use_tok else None
+        logits, _ = forward_region(x, None, None, emb)   # ink-only, like lineart_region
+        return kernel_ce(logits, ya, kernel, ce_w)
+
+    def refined_mask_clip(files):
+        """CLIP-through-masks on PINNED glyphs (colorize mode): input ink
+        channel = the refined grid's own render, RGB = the photo; the model's
+        masks pick the colors, CLIP judges the result, the blurred-MSE anchor
+        conserves tone mass. The only photo-domain gradient the masks get --
+        and it can only choose colors that exist in the cell."""
+        ent = load_refined(files[int(rng.integers(len(files)))])
+        gh_r, gw_r = ent["gh"], ent["gw"]
+        R = min(gh_r, int(rng.integers(10, 15)))
+        Cc = min(gw_r, int(rng.integers(20, 31)))
+        top = int(rng.integers(0, gh_r - R + 1))
+        left = int(rng.integers(0, gw_r - Cc + 1))
+        ys, xs = np.mgrid[top:top + R, left:left + Cc]
+        cells = torch.from_numpy((ys * gw_r + xs).ravel())
+        g_sub = ent["glyphs"][cells].to(device)
+        M = R * Cc
+        ink_sub = ink_flat_d[g_sub].view(R, Cc, ch, cw) \
+            .permute(0, 2, 1, 3).reshape(R * ch, Cc * cw)
+        ink_u8 = np.clip(ink_sub.cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+        rgb_sub = ent["rgb"][top * ch:(top + R) * ch,
+                             left * cw:(left + Cc) * cw]
+        xw = torch.from_numpy(grid_windows(ink_u8, R, Cc, ch, cw, ph, pw)) \
+            .float().div_(255).unsqueeze(1)
+        xcw = torch.from_numpy(grid_windows(rgb_sub.numpy(), R, Cc, ch, cw,
+                                            ph, pw, edge=True)) \
+            .permute(0, 3, 1, 2)
+        x = torch.cat([xw, xcw], dim=1).to(device)
+        ids_s, val_s = token_maps(R, Cc, rows, cols)
+        ids_st = torch.from_numpy(ids_s)
+        val_st = torch.from_numpy(val_s)
+        feats_tok = (None if scratch else
+                     (ent["feats"][cells][ids_st]
+                      * val_st[:, :, None].float()).to(device))
+        emb = zero_emb if use_tok else None
+        cts, pms = [], []
+        for i in range(0, M, args.chunk):
+            n = x[i:i + args.chunk].shape[0]
+            e = emb[None].expand(n, -1) if emb is not None else None
+            t, s1 = model._tokens(x[i:i + args.chunk], e,
+                                  feats_tok[i:i + args.chunk]
+                                  if feats_tok is not None else None, 2,
+                                  want_skip=True)
+            cts.append(t[:, model.center])
+            s1c = s1.view(n, rows * cols, *s1.shape[1:])[:, tci]
+            pms.append(model.mask_dec(t[:, model.center], s1c))
+        ct = torch.cat(cts)
+        mlog_c = torch.cat(pms)
+        if args.mask_logit_noise > 0:
+            mlog_c = mlog_c + args.mask_logit_noise * torch.randn_like(mlog_c)
+        th_, tw_ = ch + 2 * ph, cw + 2 * pw
+        if args.mask_margin_fit:
+            # full-patch fit: the un-cropped mask votes margin pixels
+            # (neighbors' territory) into this cell's colors
+            pm = (mlog_c / max(args.mask_temp, 1e-3)).softmax(1)
+            C = x[:, 1:4, ch:ch + th_, 2 * cw:2 * cw + tw_] \
+                .permute(0, 2, 3, 1).reshape(M, th_ * tw_, 3)
+        else:
+            pm = (mlog_c[:, :, ph:ph + ch, pw:pw + cw]
+                  / max(args.mask_temp, 1e-3)).softmax(1)
+            C = ent["cell_rgb"][cells].to(device)
+        fgm, bgm = mask_fit(pm, C)
+        lreg = pm.new_zeros(())
+        if args.mask_k:
+            khat = 4.0 * torch.sigmoid(model.k_head(ct)[:, 0] + K_BIAS)
+            mid = 0.5 * (fgm + bgm)
+            fgm = mid + khat[:, None] * (fgm - mid)
+            bgm = mid + khat[:, None] * (bgm - mid)
+            fgm = fgm + (fgm.clamp(0, 1) - fgm).detach()
+            bgm = bgm + (bgm.clamp(0, 1) - bgm).detach()
+            kf = khat.view(R, Cc)
+            lreg = args.tv_weight * ((kf[:, 1:] - kf[:, :-1]).pow(2).mean()
+                                     + (kf[1:] - kf[:-1]).pow(2).mean()) \
+                + args.k_prior * (khat - 1.0).pow(2).mean()
+        dmask = (fgm - bgm).abs().mean(1)
+        vis = (g_sub != cache.space).float()
+        if args.mask_sep_floor_weight > 0:
+            lreg = lreg + args.mask_sep_floor_weight * (
+                vis * F.relu(args.mask_sep_floor - dmask)).mean()
+        if args.mask_structure_weight > 0:
+            fe = ent["feats"][cells].to(device)      # [gate, sep, fg3, bg3, mean3]
+            d_dec = (fe[:, 2:5] - fe[:, 5:8]).abs().mean(1)
+            lreg = lreg + args.mask_structure_weight * (
+                fe[:, 0] * F.relu(args.mask_structure_frac * d_dec - dmask)).mean()
+        if args.mask_pseudo_weight > 0 and ent["fg_ref"] is not None:
+            # pseudo-masks from the engine's refined colors: photo pixels
+            # assigned to the nearer color -- content geometry, not glyph
+            # geometry, so the mask can learn strokes OFFSET from the glyph
+            fr = ent["fg_ref"][cells].to(device)
+            br = ent["bg_ref"][cells].to(device)
+            dfg = (C - fr[:, None]).pow(2).sum(-1)
+            dbg = (C - br[:, None]).pow(2).sum(-1)
+            hh, ww_ = (th_, tw_) if args.mask_margin_fit else (ch, cw)
+            afg = (dfg < dbg).float().view(M, hh, ww_)
+            # cells whose REFINED colors don't separate carry the all-bg
+            # target: the engine looked and found one color -- "no content
+            # here, commit to background". Every cell now gets supervision
+            # every refT step (the unsupervised-background melt is closed)
+            gsep = ((fr - br).abs().mean(1) > 0.05).float()
+            afg = afg * gsep[:, None, None]
+            tgtp = torch.stack([afg, 1 - afg, torch.zeros_like(afg)], 1)
+            lg = mlog_c if args.mask_margin_fit \
+                else mlog_c[:, :, ph:ph + ch, pw:pw + cw]
+            pce = -(tgtp * F.log_softmax(lg, dim=1)).sum(1).mean((-1, -2))
+            lreg = lreg + args.mask_pseudo_weight * pce.mean()
+        fgr, bgr = fgm, bgm
+        if args.mask_color_blend < 1.0 or args.mask_color_target > 0:
+            fe_ = ent["feats"][cells].to(device)
+            fg_f, bg_f = fit_fg_bg_distweighted(C, ink_flat_d[g_sub],
+                                                bg_dist_all[g_sub], pow_=1.0)
+            fg_cf = (0.5 * fe_[:, 2:5] + 0.5 * fg_f).detach()
+            bg_cf = (0.5 * fe_[:, 5:8] + 0.5 * bg_f).detach()
+            if args.mask_color_target > 0:
+                visf = (g_sub != cache.space).float()[:, None]
+                lreg = lreg + args.mask_color_target * (
+                    (visf * (fgm - fg_cf).pow(2)).mean()
+                    + (bgm - bg_cf).pow(2).mean())
+            b = args.mask_color_blend
+            if b < 1.0:
+                fgr = fg_cf + b * (fgm - fg_cf)
+                bgr = bg_cf + b * (bgm - bg_cf)
+        mask_g = ink_flat_d[g_sub]
+        cell = bgr[:, None, :] + (fgr - bgr)[:, None, :] * mask_g[:, :, None]
+        img = cell.view(R, Cc, ch, cw, 3).permute(0, 2, 1, 3, 4) \
+            .reshape(R * ch, Cc * cw, 3)
+        rgb_d = rgb_sub.to(device)
+        lclip = clipper(img, rgb_d)
+        anchor = args.mask_blur_anchor * F.mse_loss(blur_img(img, float(cw)),
+                                                    blur_img(rgb_d, float(cw)))
+        return lclip, anchor + lreg + args.mask_abstain_prior * pm[:, 2].mean()
 
     def color_image(g_or_st, khat, dec, mask, gh, gw):
         C = dec["cell_rgb"].to(device)
@@ -541,9 +1148,44 @@ def main():
         x, feats_tok, ids_t, valid_t = region_inputs(rgb, dec, ink_u8, gh, gw)
         emb = photo_emb[path] if use_tok and path in photo_emb else \
             (zero_emb if use_tok else None)
-        logits, ct = forward_region(x, feats_tok, 1, emb)
+        mask_l = None
+        want_masks = masks_on and (args.mask_photo_prior > 0
+                                   or args.mask_sep_floor_weight > 0
+                                   or args.mask_structure_weight > 0)
+        if want_masks:
+            logits, ct, mlog = forward_region_masks(x, feats_tok, 1, emb)
+            if args.mask_logit_noise > 0:
+                mlog = mlog + args.mask_logit_noise * torch.randn_like(mlog)
+            pmc = mlog[:, tci, :, ph:ph + ch, pw:pw + cw]
+            mask_l = pmc.new_zeros(())
+            if args.mask_photo_prior > 0:
+                lp = F.log_softmax(pmc, dim=1)
+                tink = dec["ink"].to(device).view(M, ch, cw)
+                mask_l = mask_l + args.mask_photo_prior * \
+                    (-(tink * lp[:, 0] + (1 - tink) * lp[:, 1])).mean()
+        else:
+            logits, ct = forward_region(x, feats_tok, 1, emb)
         khat = 4.0 * torch.sigmoid(model.k_head(ct)[:, 0] + K_BIAS)
         pbar = ensemble(logits, ids_t, valid_t, M)
+        if want_masks and (args.mask_sep_floor_weight > 0
+                           or args.mask_structure_weight > 0):
+            fgm_, bgm_ = mask_fit((pmc / max(args.mask_temp, 1e-3)).softmax(1),
+                                  dec["cell_rgb"].to(device))
+            dmask = (fgm_ - bgm_).abs().mean(1)
+            if args.mask_sep_floor_weight > 0:
+                # a VISIBLE glyph must be visible: separate the colors or
+                # raise p_space (both routes differentiable -- the model may
+                # legitimately escape by choosing the empty cell)
+                p_space = pbar[:, cache.space]
+                mask_l = mask_l + args.mask_sep_floor_weight * (
+                    (1 - p_space) * F.relu(args.mask_sep_floor - dmask)).mean()
+            if args.mask_structure_weight > 0:
+                # decompose certified two colors here: the mask fit must
+                # recover a fraction of that separation -- anti-mush, direct
+                d_dec = (dec["fg"] - dec["bg"]).abs().mean(1).to(device)
+                mask_l = mask_l + args.mask_structure_weight * (
+                    dec["gate"].to(device)
+                    * F.relu(args.mask_structure_frac * d_dec - dmask)).mean()
         u = torch.rand_like(pbar).clamp_(1e-9, 1 - 1e-9)
         g = (pbar.clamp_min(1e-9).log() - torch.log(-torch.log(u))).argmax(-1)
         st = F.one_hot(g, N).float() + pbar - pbar.detach()
@@ -564,8 +1206,10 @@ def main():
             + (kf[1:] - kf[:-1]).pow(2).mean())
         loss = loss + reg_mult * args.k_prior * (khat - 1.0).pow(2).mean()
         lk = aux_l
+        if mask_l is not None:
+            lk = lk + mask_l           # unscaled channel: lambda cannot dilute it
         if k_target is not None:
-            lk = aux_l + args.k_reg_weight * F.mse_loss(khat, k_target)
+            lk = lk + args.k_reg_weight * F.mse_loss(khat, k_target)
         elif refine:
             # semi-stochastic target: a few CLIP iterations FROM the model's own
             # k_hat over frozen glyphs/colors; supervise the difference
@@ -596,7 +1240,7 @@ def main():
                 ropt.step()
                 with torch.no_grad():
                     k0.data.clamp_(0.0, 4.0)
-            lk = aux_l + args.k_reg_weight * F.mse_loss(khat, k0.detach().view(-1))
+            lk = lk + args.k_reg_weight * F.mse_loss(khat, k0.detach().view(-1))
         return loss, lk, float(khat.mean()), float((g != cache.space).float().mean())
 
     def coltext_batch():
@@ -604,6 +1248,10 @@ def main():
                                                 args.batch)]
         x, y, xc, fg_t, bg_t = synth.sample(idx, rng, want_color=True)
         B, T = y.shape
+        do_mask = masks_on and rng.random() < args.coltext_corrupt
+        calpha = None
+        if do_mask:                     # colored junk; ink/labels stay clean
+            xc, calpha = corrupt_color_batch(xc, rng, ink=x[:, 0])
         if scratch:
             x = torch.cat([x, xc], dim=1)
             feats = None
@@ -612,20 +1260,50 @@ def main():
             mean = 0.5 * (fg_t + bg_t)
             feats = torch.cat([torch.ones(B, T, 1, device=device),
                                sep.clamp(0, 1), fg_t, bg_t, mean], dim=-1)
+            if in4:
+                x = torch.cat([x, xc], dim=1)
         emb = zero_emb if use_tok else None
-        lo, to = [], []
+        lo, to, mo = [], [], []
         for i in range(0, B, args.chunk):
             n = x[i:i + args.chunk].shape[0]
             e = emb[None].expand(n, -1) if emb is not None else None
-            t = model._tokens(x[i:i + args.chunk], e,
-                              feats[i:i + args.chunk] if feats is not None
-                              else None, 1)
+            if do_mask:
+                t, s1 = model._tokens(x[i:i + args.chunk], e,
+                                      feats[i:i + args.chunk]
+                                      if feats is not None else None, 1,
+                                      want_skip=True)
+                mo.append(model.mask_logits(t, s1))
+            else:
+                t = model._tokens(x[i:i + args.chunk], e,
+                                  feats[i:i + args.chunk] if feats is not None
+                                  else None, 1)
             lo.append(model.head(t[:, model.n_extra:]))
             to.append(t[:, model.n_extra:])
         ce = kernel_ce(torch.cat(lo), y, kernel, ce_w)
         pred = torch.sigmoid(model.col_head(torch.cat(to)))
         aux = F.mse_loss(pred, torch.cat([fg_t, bg_t], dim=-1))
-        return ce + args.aux_weight * aux
+        loss = ce + args.aux_weight * aux
+        if do_mask:
+            # dense mask supervision: fg = the clean rendered ink, bg = its
+            # complement, abstain = the corruption alpha; plus per-cell color
+            # recovery through the junk (true palette is known exactly)
+            tf = unfold_cores(x[:, :1], 1)[:, :, 0]           # (B,T,ch,cw)
+            ta = unfold_cores(calpha[:, None], 1)[:, :, 0]
+            tgt = torch.stack([tf * (1 - ta), (1 - tf) * (1 - ta), ta], dim=2)
+            mcore = torch.cat(mo)[:, :, :, ph:ph + ch, pw:pw + cw]
+            pixfn = plain_pix if args.mask_bootstrap == "plain" else vote_pix
+            mce = ((pixfn(mcore, tgt).mean((-1, -2))
+                    * kernel[None, :]).sum(1) / kernel.sum()).mean()
+            pm = mcore.softmax(2).reshape(B * T, 3, ch, cw)
+            Cpix = unfold_cores(xc, 3).permute(0, 1, 3, 4, 2) \
+                .reshape(B * T, ch * cw, 3)
+            lcol = fit_color_loss(pm, Cpix, fg_t.reshape(-1, 3),
+                                  bg_t.reshape(-1, 3),
+                                  tf.reshape(B * T, -1).mean(1))
+            loss = loss + args.mask_ce_weight * mce \
+                + args.mask_color_weight * lcol \
+                + args.mask_abstain_prior * pm[:, 2].mean()
+        return loss
 
     def lineart_region():
         ri = train_runs[int(rng.integers(len(train_runs)))]
@@ -681,7 +1359,14 @@ def main():
         r = rng.random()
         recal = (step % args.recal_every) < 2 or lam is None
         km = nb = -1.0
-        if ans_targets and rng.random() < args.target_frac:
+        if args.mask_only:
+            kind = "maskonly"
+            files = sorted(glob.glob(os.path.join(ref_dir, "*.npz")))
+            lclip, lextra = refined_mask_clip(files)
+            loss = lclip + lextra          # single trainable module: fixed 1.0
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+        elif ans_targets and rng.random() < args.target_frac:
             kind = "ansT"
             T = ans_targets[int(rng.integers(len(ans_targets)))]
             xw = torch.from_numpy(grid_windows(T["ink"], T["gh"], T["gw"],
@@ -697,12 +1382,39 @@ def main():
                              torch.full_like(ids_at, -1))
             ce_t = kernel_ce(logits, ya, kernel, ce_w)
             khat = 4.0 * torch.sigmoid(model.k_head(ct)[:, 0] + K_BIAS)
-            lk_t = (T["w"].to(device) * (khat - T["k"].to(device)).pow(2)).mean()
+            lk_t = args.ans_k_scale * (T["w"].to(device)
+                                       * (khat - T["k"].to(device)).pow(2)).mean()
             loss = ce_t + lk_t
             opt.zero_grad(set_to_none=True)
             loss.backward()
             km = float(khat.mean())
             nb = float((glab != cache.space).float().mean())
+        elif args.refined_pool and rng.random() < args.refined_frac and \
+                (ref_files := sorted(glob.glob(
+                    os.path.join(ref_dir, "*.npz")))):
+            line_files = [f for f in ref_files
+                          if ".ln_w" in os.path.basename(f)]
+            col_files = [f for f in ref_files
+                         if ".ln_w" not in os.path.basename(f)]
+            if line_files and rng.random() < args.refined_lineart_frac:
+                kind = "refL"
+                loss = refined_lineart_ce(line_files)
+            else:
+                kind = "refT"
+                cf = col_files or ref_files
+                loss = refined_scatter_ce(cf)
+                if masks_on and args.mask_clip:
+                    # CLIP part rides lam (grad-calibrated by the photo/lineart
+                    # pair); anchors/priors are absolute color units, unscaled
+                    lclip, lextra = refined_mask_clip(cf)
+                    loss = loss + (lam if lam is not None else 0.0) * lclip + lextra
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+        elif masks_on and rng.random() < args.mask_frac:
+            kind = "colorart"
+            loss = colorart_region()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
         elif r < args.photo_frac:
             kind = "photo"
             if ktarg and (step + 1) <= args.k_refine_start:

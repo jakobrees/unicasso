@@ -63,6 +63,7 @@ underneath. Pass `--early-stop-patience 0` to force the full length.
 | `--color-palette N` | quantize colors to an N-entry palette |
 | `--recolor-min-contrast F` | minimum fg/bg luminance gap so glyphs don't vanish in smooth regions (default 0.12) |
 | `--no-color-contrast-learn` | disable the learned per-cell contrast `k` (on by default; learned in the run's tail) |
+| `--color-lite CKPT` | colour every cell as the distilled v2 model would (`weights/lite/unicasso-lite-color*.pt`, match the font kit) instead of the closed-form fit — the run then optimizes shape inside the palette that model can produce. Not the default |
 
 ## Perceptual metric
 
@@ -89,4 +90,8 @@ GLYPHVAE_FONT=sfmono unicasso photo.jpg      # SF Mono, the terminal default on 
 
 For an instant result without the optimizer, the `unicasso-lite` feedforward
 models render a photo in well under a second — see the README's *Distilled
-models* section. They take their own small flag set: `python -m unicasso.lite --help`.
+models* section. They take their own small flag set: `python -m unicasso.lite --help`
+— `--font`, `--width`, `--line`, `--out`, `--png`, glyph bans, and
+`--refine N` (polish with N optimizer iterations, colour- or shape-aware
+depending on the model). How the model is read is fixed by its checkpoint,
+not by a flag.

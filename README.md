@@ -99,6 +99,7 @@ Common flags (full list in [`docs/flags.md`](docs/flags.md)):
 | flag | does |
 |---|---|
 | `--color` | 24-bit ANSI output (fg/bg fitted per cell); needs fewer iters |
+| `--color-lite weights/lite/unicasso-lite-color.pt` | with `--color`: colour every cell the way the distilled v2 model would, instead of the closed-form fit (see [Distilled models](#distilled-models)); pick the file matching the font kit |
 | `--base-width N` | grid width in characters (default 60) |
 | `--ban-chars "…"` / `--ban-blocks` / `--ban-letters` | drop glyphs from the charset |
 | `--iters N` | quality/speed trade-off (300 = quick sketch, 3500 = default) |
@@ -142,11 +143,12 @@ To retrain on your own corpus (or another font's native renders), follow
 
 - `unicasso/` — the package: `engine/` (optimizer: asciify, swarm, pool, CLIP
   stack, color), `substrate/` (glyphs, rasterizer, VAE model, font_kit),
-  `training/` (glyph-VAE trainer), `adapter/` (CLIP domain adaptation),
+  `training/` (glyph-VAE and distilled-model trainers), `adapter/` (CLIP domain adaptation),
   `output/` (recolor/colorize tools), `lineart/` (photo→line front-ends),
   `curation/` (glyph curation GUIs), `artcode/` (QR codes that carry the art).
 - `kits/` — font kits (charset, cell geometry, per-font recipe block).
-- `weights/` — glyph-VAE checkpoints + the optional CLIP adapter (small, committed).
+- `weights/` — glyph-VAE checkpoints, the distilled `lite/` models and the
+  optional CLIP adapter (small, committed).
 - `docs/` — [font onboarding](docs/fonts.md), [adapter training](docs/adapter.md).
 - `legacy/` — archived reference implementations discussed in the paper.
 
@@ -188,26 +190,79 @@ per-cell transformer glyph classifier trained on the swarm optimizer's own
 renders. No CLIP, no search — a photo becomes ANSI in well under a second
 instead of an hour.
 
+| target | UNICASSO | unicasso-lite |
+|:---:|:---:|:---:|
+| <img src="examples/colored/blurred_reference.png" width="260"> | <img src="examples/colored/blurred.png" width="260"> | <img src="examples/lite/blurred_w60_lite_v2.png" width="260"> |
+| <img src="examples/monochrome/gorilla_bike_lines.jpg" width="260"> | <img src="examples/monochrome/gorilla_bike.png" width="260"> | <img src="examples/lite/bike_w60_lite_v1_sfmono.png" width="260"> |
+
 A per-cell classifier has no global objective coupling cells, so it
 reproduces broad tone and layout but drops sub-cell detail and
 semantically important regions that the optimizer's CLIP loss preserves.
+Features are re-resolved at each grid size:
+
+| 40 columns | 50 columns | 60 columns |
+|:---:|:---:|:---:|
+| <img src="examples/lite/cooking_w40_lite_v2_sfmono.png" width="260"> | <img src="examples/lite/cooking_w50_lite_v2_sfmono.png" width="260"> | <img src="examples/lite/cooking_w60_lite_v2_sfmono.png" width="260"> |
 
 ```bash
 python -m unicasso.lite photo.jpg --width 60          # 24-bit ANSI to stdout
 python -m unicasso.lite photo.jpg -w 80 --out art.ans # write a cat-able file
+python -m unicasso.lite photo.jpg -w 60 --png art.png # also save the pixel render
+python -m unicasso.lite photo.jpg --font sfmono       # the SF Mono kit's models
 python -m unicasso.lite drawing.png --line            # monochrome ASCII art (plain text, no color)
+python -m unicasso.lite photo.jpg --refine 300        # + 300 optimizer iterations (see below)
 ```
 
-Two models ship in [`weights/lite/`](weights/lite/): **color** (per-cell Lab
-decomposition → glyph classifier → closed-form blend colors → learned per-cell
-contrast) and **line** (monochrome ASCII art, plain text). The color model takes
-any image; the **line model expects line art** — feed it a drawing, or convert a
-photo first (see [From photo to ASCII](#from-photo-to-ascii)). As a library:
+Two models per font ship in [`weights/lite/`](weights/lite/): **color** and
+**line** (monochrome ASCII art, plain text). The color model takes any image;
+the **line model expects line art** — feed it a drawing, or convert a photo
+first (see [From photo to ASCII](#from-photo-to-ascii)).
+
+### Refining a lite result
+
+```bash
+python -m unicasso.lite photo.jpg -w 60 --refine 300
+```
+
+`--refine N` hands the lite result to the full optimizer as a warm start for
+N iterations — the same recipe the v2 models' own training pools were refined
+with (the lite grid is the incumbent at full weight, one annealing cycle, no
+fresh exploration). What happens depends on the model, nothing to configure:
+
+- **line model** — shape refinement only, monochrome.
+- **v2 colour model** — the optimizer runs *in the colours the model paints
+  itself*: every candidate glyph is rendered and scored with the fg/bg this
+  model would give it, so it cannot buy score with a palette the model can't
+  reproduce; the refined grid is then coloured by the model.
+- **v1 colour model** — the optimizer's closed-form colours.
+
+Below ~300 iterations it likely doesn't help much; a few hundred take
+minutes on an M-series Mac and need the engine's dependencies (`open_clip`). Everything else about the lite CLI is automatic:
+the model is picked by `--font`, and how it is read and coloured is fixed by
+the checkpoint.
+
+**v2 color models.** The v1 color model fitted two colors per cell from a Lab
+decomposition and scaled their contrast with a learned field. v2 predicts a
+**per-pixel foreground/background mask** for every cell and fits the two colors
+through it in closed form — glyph and coloring off one forward pass — and was
+trained from scratch by `train_campaign.sh`: glyph cross-entropy against the
+optimizer's renders, a mask target from the drawings' true ink, a CLIP loss on
+photos, and rolling pools of grids refined by the optimizer in the model's own
+colors. Textures and small structure are what changed most:
+
+| target | lite v1 | lite v2 |
+|:---:|:---:|:---:|
+| <img src="examples/lite/leaves_reference.jpg" width="260"> | <img src="examples/lite/leaves_w40_lite_v1_sfmono.png" width="260"> | <img src="examples/lite/leaves_w40_lite_v2_sfmono.png" width="260"> |
+| <img src="examples/lite/corner_reference.jpg" width="260"> | <img src="examples/lite/corner_w60_lite_v1_sfmono.png" width="260"> | <img src="examples/lite/corner_w60_lite_v2_sfmono.png" width="260"> |
+
+The v1 models remain loadable (`--weights weights/lite/unicasso-lite-color-v1.pt`).
+Each checkpoint records how its glyph head is meant to be read — v2 at the
+window centre, v1 as a framing ensemble — and `Lite` follows it. As a library:
 
 ```python
 from unicasso.lite import Lite
 out = Lite("color").render("photo.jpg", width=60)
-print(out.ans)                                        # out.txt / out.glyphs / out.k also set
+print(out.ans)                                        # out.txt / out.glyphs / out.render also set
 ```
 
 **In the terminal.** `pip install -e .` puts `unicasso-lite` on your PATH, and
@@ -220,7 +275,9 @@ unicasso-lite photo.jpg                               # fills the terminal
 unicasso-lite photo.jpg -w 40 > logo.ans              # a fixed-width file
 ```
 
-Build notes: [`docs/lite-devlog.md`](docs/lite-devlog.md).
+Build notes: [`docs/lite-devlog.md`](docs/lite-devlog.md) (v2 color models,
+training recipe) and [`docs/lite-v1-devlog.md`](docs/lite-v1-devlog.md) (line
+models and the v1 color model).
 
 ## artcode
 
@@ -252,5 +309,5 @@ judge and the random-crop + augmentation structure of the CLIP passes follow
 ---
 
 <p align="center">
-  <img src="examples/colored/patagonia.png" width="100%" alt="Patagonia, colored render">
+  <img src="examples/lite/tokyo_w120_lite_v2_sfmono.png" width="100%" alt="Tokyo skyline, unicasso-lite v2 at 120 columns">
 </p>

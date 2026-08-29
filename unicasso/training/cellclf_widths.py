@@ -57,10 +57,14 @@ def load_any(path, meta, device):
         m = TokenTransformer(rows, cols, meta["cell_h"], meta["cell_w"],
                              meta["pad_h"], meta["pad_w"], N, dim=cfg["dim"],
                              heads=cfg["heads"], n_blocks=cfg.get("blocks", 1),
-                             clip_dim=meta["clip_dim"] if cfg["clip_token"] else 0)
+                             clip_dim=meta["clip_dim"] if cfg["clip_token"] else 0,
+                             in_ch=cfg.get("in_ch", 1))
     else:
         m = WindowCNN(rows * meta["cell_h"] + 2 * meta["pad_h"],
                       cols * meta["cell_w"] + 2 * meta["pad_w"], N)
+    if is_tf and "mask_dec.out.weight" in ck["state_dict"]:
+        from unicasso.training.train_cell_classifier import MaskDecoder
+        m.mask_dec = MaskDecoder(cfg["dim"])
     m.load_state_dict(ck["state_dict"])
     return m.to(device).eval(), cfg
 

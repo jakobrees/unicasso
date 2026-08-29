@@ -1,205 +1,182 @@
-# unicasso-lite: development notes
+# unicasso-lite v2: development notes
 
-Two distilled per-cell classifiers (`unicasso-lite-line`, `unicasso-lite-color`)
-that replace the swarm optimizer with a single forward pass. A w90 color render
-completes in ~0.35 s end-to-end on Apple Silicon — 40–60× faster than the
-50-iteration optimizer pipeline, at ~0.1 ms/cell.
+The v2 colour models replace the v1 per-cell colouring (Lab decomposition →
+closed-form fg/bg → learned contrast field) with a **per-pixel mask**: the
+network decides, for every pixel of every cell, whether it belongs to the
+foreground, the background, or neither, and the two colours are then the
+closed-form best fit *through that mask*. Glyph choice and colouring come off
+the same forward pass. Both fonts (`dejavu`, `sfmono`) were trained from
+random initialisation with one script, `train_campaign.sh`, in ~5 GPU-hours
+each.
 
-Both models are 0.48M-parameter `TokenTransformer` networks (dim 64, 4 heads,
-3 blocks) reading a 5×3-cell window. The line model predicts glyphs from
-grayscale ink; the color model additionally conditions on per-cell Lab
-decomposition features and predicts foreground/background colors plus a
-per-cell contrast field k.
+The line models are unchanged from v1 — see [`lite-v1-devlog.md`](lite-v1-devlog.md)
+for their pipeline and for the v1 colour model.
 
 
 ## Architecture
 
-**Per-cell CNN tokens + transformer.**  Each cell in the 5×3 window is encoded
-independently by a shared 3-layer conv trunk (32→64→128 channels, stride 2,
-GroupNorm+GELU) into a 1920-dim vector, projected to 64 dims.  The 15 tokens
-get learned positional embeddings, then pass through 3 pre-LN transformer
-blocks (multi-head attention + MLP).  The center token's representation is
-read out by a linear head for glyph classification.
+**Glyph classifier** (as v1, widened): each cell of a 3×5-cell window is
+encoded by a shared 3-layer conv trunk (4→32→64→128 channels, stride 2,
+GroupNorm+GELU) and projected to a 96-dim token; 15 tokens with learned
+positions go through 3 pre-LN transformer blocks (4 heads, FFN 96→384→96).
+The four input channels are the decompose ink estimate plus RGB. The centre
+token's head gives the glyph; an **auxiliary block + head** trains the 14
+neighbour positions, so the main head is supervised at the centre only.
 
-**Framing-ensemble accumulation.**  A cell sits in 15 different 5×3 windows
-(one for each possible offset).  At inference, all 15 framings are forwarded
-and each framing's softmax distribution is weighted by a separable binomial
-kernel (center=1, falling off toward the edges) and accumulated via
-`index_add` into per-cell probability mass.  The argmax of the accumulated
-distribution is the prediction.  This makes inference translation-invariant
-without any explicit data augmentation — the same cell's prediction is
-identical regardless of which region you forward it inside.
+**Mask decoder.** The mask is an inner product: a per-pixel encoder over the
+cell's RGB (two identity-initialised residual blocks, ~13×13 receptive field)
+produces a 32-dim embedding per pixel, and the cell's token produces three
+32-dim queries — foreground, background, abstain. The logit for pixel *p* and
+class *k* is `⟨f(p), q_k⟩/√32 + b_k`. Polarity (which side is foreground) is
+therefore the *sign* of `q_fg − q_bg`, a linear change the token can make per
+cell. The per-pixel encoder additionally receives, broadcast over the cell,
+the cell's RGB minus its mean (3 ch) and an 8-dim embedding of the chosen
+glyph.
 
+**Mask branch depth.** The mask decoder does not read the classifier token
+directly: it reads it through three private transformer blocks, into which
+two extra signals are injected — a colour encoder over the cell RGB that
+shares nothing with the glyph path (`mask_ctx`, injected at block 0), and a
+linear map of the glyph softmax (`glyph_ctx`, block 1). Measured on the
+trained dejavu model these carry 2.5× and 0.13× the shared token's norm
+respectively: the colouriser mostly reads its own encoder, and its mask is
+stroke-shaped rather than glyph-shaped.
 
-## Training pipeline: line model
+**Colours.** For each cell, foreground and background are the least-squares
+optimum of the cell's pixels blended through the mask (`--read-path blend`:
+every pixel votes with its probability, fully differentiable). There is no
+learned colour and no contrast head; what is optimised in training is exactly
+what ships.
 
-Training data = the optimizer's own per-cell glyph decisions cached as
-`(ink_window, label)` pairs.  ~110 lineart images × 2 widths, ~400k cells.
-
-### Stage 1: dense imitation
-
-Cross-entropy on optimizer labels, with the dense objective: every cell in the
-5×3 window is supervised (not just the center), weighted by the binomial
-kernel.  Blank-weight 0.2 (space is ~40% of cells; down-weighting prevents
-the model from learning to predict space everywhere).  The headline evaluation
-metric is accuracy on cells where the optimizer *disagreed* with greedy
-nearest-glyph snapping — those are the only cells where context matters.
-
-### Stage 2: beyond-the-dataset objectives
-
-Pure imitation has a ceiling: ~77.5% top-1.  Two objectives push past it.
-
-**Straight-through stochastic CLIP.**  Sample from the classifier's predicted
-distribution (Gumbel-max categorical, straight-through gradient), render the
-sampled glyphs as a pixel mosaic (8×8 tiles of 5×3-cell windows), and take a
-crop-augmented CLIP RN101 perceptual loss against the source ink image.  The
-gradient flows through the straight-through estimator back to the logits.
-This lets the model learn to prefer glyphs that *look right* to CLIP, not
-just match the optimizer's label — which is itself only an approximation.
-
-**Letter-render synthetic targets.**  Real label windows are re-rendered with
-per-glyph affine jitter (±2 px translation, ±4° rotation, ±8% scale) and a
-global sub-cell phase shift.  A 5% tail of random glyphs is sprinkled in.
-Labels are exact by construction.  This stream never repeats, so the model
-sees unlimited supervised data at the cost of slight domain shift from real
-ink.
-
-**Dynamic lambda.**  The CLIP loss weight is auto-calibrated: every 100 steps
-the gradient norms of the CE and CLIP terms are measured, and lambda is
-adjusted so that `||g_clip|| / ||g_ce||` targets 0.1–0.2.  An EMA
-smooths the ratio.  This avoids the CLIP term overwhelming the label signal
-(or being invisible).
-
-### Stage 3: Muon optimizer
-
-Newton-Schulz orthogonalization (5 quintic iterations) on hidden 2D matrices
-(attention projections, MLP, token projection).  Trunk convolutions,
-embeddings, norms, biases, and the classification head stay on AdamW.  The
-update is spectral — direction, not magnitude — so learning keeps serving
-consistent directions even as the loss surface flattens.
-
-Measured 2.5–4× step efficiency over AdamW alone.  The caveat: cosine
-schedule length must match the actual run length.  A 3000-step schedule on a
-1000-step run wastes its peak; a 1000-step schedule on a 3000-step run burns
-out early.  The final recipe is 1000 Muon steps with matched cosine.
-
-### Stage 4: global fine-tune
-
-The window-level CLIP term judges 5×3 patches.  The global fine-tune judges
-contiguous grid regions (up to 26×44 cells) the way the optimizer was judged:
-differentiable framing-ensemble accumulation over the full region, Gumbel-ST
-sampling of the entire grid, crop-augmented CLIP against the run's actual
-lineart.  Dense CE stays as the anchor; lambda targets 20%.
-
-400 steps with Muon.  val-clip improved from .3123 to .3163 with no accuracy
-loss (.7921 top-1 vs .792 before).
+| | dejavu | sfmono |
+|---|---|---|
+| glyphs | 356 | 358 |
+| cell | 16×34 | 18×36 |
+| params | 1.56 M | 1.63 M |
 
 
-## Training pipeline: color model
+## Objective
 
-The color model starts from the line model's weights and adds four zero-init
-modules: `color_proj` (11-dim per-cell features → dim), `mode_emb` (a
-lineart/photo task token added to every cell embedding), `k_head` (per-cell
-contrast, k = 4·sigmoid(raw + log 1/3) so k(0) = 1), and `col_head` (aux
-fg/bg color prediction, train-only).  All zero-init means step 0 of color
-training reproduces the line model exactly.
+Six loss arms, each with its gradient **normalised by an EMA of its own norm**
+and then weighted: `g = Σ_i w_i · g_i / EMA‖g_i‖`. Every arm contributes
+exactly `w_i` in gradient norm regardless of its natural scale (the raw scales
+differ by 30–100×), and no arm's weight depends on its own gradient. The
+weights sum to 1 in every phase so the effective learning rate is constant
+across hand-overs.
 
-### Multi-task batch mix
+| arm | supervision |
+|---|---|
+| `line_ce` | glyph cross-entropy on the lineart cache (the optimizer's own renders of line drawings), centre head + auxiliary head at 0.3 |
+| `line_color` | per-pixel CE of the mask against the cache's *true ink*: ink → fg, paper → bg |
+| `clip` | RN101 CLIP perceptual loss between the rendered grid and the photo — 16 random crops per photo, 12 photos per step, ~1100 cells per photo with ±36% jitter |
+| `pool_line` | glyph CE on a rolling pool of lineart grids refined by the full optimizer (300 iterations, warm-started from the model) |
+| `pool_color` | glyph CE on a rolling pool of photo grids, refined the same way; coloured closed-form until step 2000, by the model itself after |
+| `mask_tgt` | per-pixel CE of the mask against decompose's own fg/bg partition on photos — the *polarity bootstrap*, injected at step 1500 and decayed to zero by 2000 |
 
-Each training step draws from one of three sources:
+Two regularisers (`space`: gate flat cells to blank; `density`: keep the
+foreground on the strokes, not the background) ride a separate channel at a
+fixed 5% share of the total gradient for the last 500 steps.
 
-- **Lineart region** (35% of steps): dense kernel CE on contiguous label-grid
-  regions.  This is the anchor that prevents the color objectives from
-  degrading glyph quality on line-art inputs.
+**Schedule** (3000 steps):
 
-- **Photo region** (50%): a random non-grid-aligned crop/zoom of a real photo
-  → `decompose` (per-cell Lab clustering: minority cluster = ink, gated by
-  JND/ratio) → ink structure → the model's own glyph predictions (ST-sampled)
-  → closed-form blend colors → apply per-cell contrast k → crop-augmented
-  CLIP loss against the photo crop.  k is continuous and differentiable, so it
-  learns directly from CLIP without sampling.
+| steps | line_ce | line_color | pool_line | pool_color | clip | note |
+|---|---|---|---|---|---|---|
+| 0–500 | .60 | .40 | | | | lineart only; the mask learns stroke shape from ink |
+| 500–700 | ⅓ | ⅓ | | | ⅓ | CLIP on |
+| 700–1000 | .50 | | | | .50 | LR step-down (see below) |
+| 1000–1500 | ⅓ | | ⅓ | | ⅓ | lineart pool prefilled (64) |
+| 1500–3000 | .15 | | .20 | .25 | .40 | colour pool prefilled; `mask_tgt` .20 → 0 over 1500–2000 |
+| 2500–3000 | | | | | | + space/density at 5% |
 
-- **Colored text** (15%): the SynthRenderer generates letter windows with
-  random per-cell fg/bg palettes.  Exact glyph CE + MSE on the aux color
-  head.  Teaches the model to read color information and produce matching
-  glyph predictions in the presence of color.
+Pools hold 64 entries, replace 32 every 250 steps, widths 40/60, 8 refinement
+workers in parallel (~12 min per pool per refresh on a GH200; the refinements
+are two thirds of the wall-clock).
 
-Lambda is cross-batch: an EMA of the lineart CE norm and photo CLIP norm
-calibrates the weight.
+**Optimiser.** Muon for the 2-D matrices (lr 0.02), AdamW for the rest (3e-4),
+the whole mask branch in its own AdamW group (6e-3); 200-step warm-up, then
+one step-down at 700 to 0.01 / 2e-4 / 4e-3 and flat to the end.
 
-### Color fitting at inference
+**Data.** Lineart cache: 298 renders of 141 corpus line drawings (sfmono) /
+546 renders of 273 `dataset_v1` line drawings (dejavu), produced by the full
+optimizer at widths 40–100; 15% of parents held out for the lineart top-1
+metric. Photos: 807 (two sources mixed 2:1), six held out for the CLIP metric,
+fixed by seed across every run. The lineart pool draws from the corpus line
+drawings with the held-out parents excluded.
 
-Predicted glyphs → closed-form per-cell fg/bg MSE fit:
 
-  fg = weighted mean of cell pixels where ink = 1
-  bg = distance-weighted mean where ink = 0  (weight = distance to nearest ink pixel, pow 1)
+## What the campaign taught
 
-The distance weighting prevents antialiasing and sub-pixel misalignment near
-glyph strokes from contaminating the background estimate.  Final colors are a
-50/50 blend of the decomposition's cluster colors and the fit colors.
-
-### Per-cell contrast k
-
-k scales the fg/bg deviation around each cell's own midpoint:
-`fg_out = mid + k·(fg − mid)`, `bg_out = mid + k·(bg − mid)`, clamped to
-[0, 1].  k = 1 is neutral; k > 1 boosts contrast; k < 1 mutes it.
-
-The model's k-head learns this in two phases:
-
-1. **Target regression** (first ~300 steps): 84 reference photos are
-   pre-processed with the model's own glyphs, then a 100-step Muon
-   optimization finds the per-cell k that minimizes CLIP loss + TV.  These k
-   fields are stored as `.npz` targets.  The model regresses them with exact
-   crop replay (same box, same width as when the target was computed) so it
-   sees the exact layout.
-
-2. **Semi-stochastic refinement** (remaining steps): from the model's
-   predicted k (detached), 3 Muon iterations at lr 0.02 refine k over the
-   frozen glyph geometry.  The loss is the difference between the refined and
-   predicted k fields.  Regularization is increased (3× multiplier) in this
-   phase to prevent k from drifting.
-
-k-losses are NOT scaled by the CLIP lambda — they have their own weight
-(`--k-reg-weight 5.0`) to prevent the dynamic lambda from drowning them out
-during photo-heavy batches.
+- **A reconstruction loss cannot bootstrap a random mask.** The first design
+  had `line_color` as an MSE between the render and the ink painted with a
+  sampled colour pair. From random initialisation the per-cell token bias
+  saturates the softmax within ~100 steps into a mask that is one-hot and
+  *constant within each cell* — polarity, inversion and contrast all read
+  exactly zero — and a saturated softmax passes no gradient, so nothing later
+  recovers it. The per-pixel ink CE has a non-zero gradient on every ink pixel
+  whatever the colour fit does; with it the mask is stroke-shaped by step 250.
+- **Stroke shape is not polarity.** With the ink CE alone the mask finds the
+  strokes but has no convention for which side is foreground on a *photo*:
+  inversion sits at ~50% (a coin flip per cell) and CLIP alone moves it only
+  slowly (49% → 38% over 700 steps). The `mask_tgt` arm — decompose's
+  partition as a target, 500 steps, decayed — takes it to 5–8%, and it keeps
+  falling after the arm is gone.
+- **…but the polarity target must come *after* CLIP, not before.** Run with
+  the same arm in phase 0 (steps 0–500) the mask hardened at step ~450 —
+  entropy 0.000, fitted contrast ~0.1 — and never recovered. The mask has to
+  be shaped by the ink CE and CLIP first; the convention is applied once there
+  is something to orient.
+- **Read the centre.** With the main head trained at the centre only, the v1
+  15-window framing ensemble reads 81% of its weight from positions no loss
+  ever supervised. The checkpoints stamp `render_ensemble: center` and `Lite`
+  reads it; the ensemble is not a user-facing knob any more.
 
 
 ## Final models
 
-| | line | color |
-|---|---|---|
-| params | 0.48M | 0.48M |
-| top-1 accuracy | .8013 | — |
-| val-clip (lineart) | .3163 | — |
-| color-clip (photos) | — | .3901 |
-| forward pass | 0.098 ms/cell | 0.098 ms/cell |
+Held-out CLIP loss on the same six photos (centre read, 1100-cell grid, lower
+is better), with the fraction of cells whose foreground/background polarity is
+inverted relative to the image's own minority cluster, and the fitted
+fg/bg contrast relative to what the cell offers (1.0 = all of it):
 
-End-to-end timing (Apple Silicon, including image load, decomposition, and
-render):
+| | clip | inverted cells | contrast reach |
+|---|---|---|---|
+| `unicasso-lite-color` (dejavu, step 3000) | .384 | 7% | .87 |
+| `unicasso-lite-color-sfmono` (step 2750) | .383 | 4% | .79 |
 
-| width | cells | time |
-|---|---|---|
-| 30 | ~500 | ~0.17 s |
-| 50 | ~1400 | ~0.23 s |
-| 90 | ~4500 | ~0.35 s |
-| 140 | ~11000 | ~0.62 s |
-
-The line model pipeline: grayscale → ink → framing-ensemble → argmax → text.
-The color model pipeline: RGB → decompose → ink + features → framing-ensemble
-→ argmax → closed-form fg/bg fit → k-contrast → 24-bit ANSI.
+Both sit at the level of the best fine-tuned models of the previous lineage on
+this metric, with roughly half their inversion rate and clearly higher contrast
+— from random initialisation, in one launch. The sfmono checkpoint is step 2750
+rather than 3000 because the `space` regulariser blanked ~30% of cells over the
+last 250 steps and cost polarity; the dejavu run did not show this.
 
 
 ## Reproduction
 
-The full training suite is in `unicasso/training/`:
-
 ```
-train_cell_classifier.py   base trainer (CE + beyond-the-dataset + Muon)
-cellclf_global_ft.py       global CLIP fine-tune
-cellclf_color_train.py     unified color multi-task trainer
-kfield_targets.py          on-policy k-target generation
+./train_campaign.sh sfmono [NAME] [DEVICE]
+./train_campaign.sh dejavu [NAME] [DEVICE]
 ```
 
-Inference: `unicasso/lite.py` (class `Lite` + CLI).
+runs the whole curriculum above from random initialisation. The trainer is
+`unicasso/training/joint_train.py`; `pool_manager.py` and `em_worker.py` run
+the refinement pools on the full optimizer; `pval.py` scores checkpoints on
+the held-out photos exactly as the trainer's `[pval@]` lines do. Requires a
+lineart cache — the optimizer's `.txt` outputs for a set of line drawings,
+packed by `python -m unicasso.training.cell_data --txt-root … --img-root …
+--out runs/cellclf/<cache> --profile <font>` (see the v1 notes) — and a photo
+directory. `--resume CKPT` continues a run from one of its checkpoints, pools
+included.
 
-Weights: `weights/lite/unicasso-lite-{line,color}.pt`.
+`--refine N` on the CLI (`auto_refine()` in the library) runs exactly the pool
+recipe on a single image: warm start from the lite grid with the incumbent's
+weight lead at 1.0, one W-temperature cycle from 0.66, z-noise 0.49, and — for
+a mask model — the optimizer running *in the model's colours* (`--color-lite`,
+mode `birth`: each slot carries the model's fg/bg for its own glyph as
+constants, so the soft render, the probe measurements and the emission all
+agree and no colour is a free variable), the final grid coloured by the model.
+Line models refine in shape only; v1 colour models use the optimizer's
+closed-form colours.
+
+Inference: `unicasso/lite.py` (class `Lite` + CLI). Weights:
+`weights/lite/unicasso-lite-color{,-sfmono}.pt` (v2) and
+`unicasso-lite-color{,-sfmono}-v1.pt` (v1, loadable with `--weights`).

@@ -25,7 +25,7 @@ from tqdm import tqdm
 from unicasso.substrate import glyphs as G
 from unicasso.substrate import orientation as O
 from unicasso.substrate.model import GlyphVAE
-from unicasso.engine.inject import Injector
+from legacy.inject import Injector
 
 from unicasso.substrate import raster as train
 

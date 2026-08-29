@@ -12,7 +12,14 @@ kits). It contains no code from prior implementations.
 """
 import torch
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFile, ImageFont, ImageOps
+
+# Set HERE rather than per-caller: every path that opens a user image -- the
+# engine, lite, the trainers, and the refinement WORKERS (separate processes
+# that import none of the training modules) -- comes through this module. A
+# single short-scanline JPEG in the photo set was killing whole worker jobs.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+Image.MAX_IMAGE_PIXELS = None            # the corpus has >100 MP scans
 
 # ---------------------------------------------------------------- geometry
 # All kit-dependent; substrate.glyphs.load_glyphs() overwrites these.

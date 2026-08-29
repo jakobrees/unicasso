@@ -75,6 +75,12 @@ def target_line_stats(target, GH, GW, CH, CW, row_gap, gate_pow=1.0):
     return cent, norm, gate
 
 
+_PERSIST = {}      # heavy-model cache for persistent E-step workers
+# (armed only under ASCIIFY_PERSIST=1: one process runs many refinement jobs
+# back-to-back and VAE/CLIP reloads would dominate short runs; normal CLI
+# invocations construct fresh models exactly as before)
+
+
 def cycled_temp(it, iters, v0, v1, cycles, decay, end_frac, shape="geo", lin_end=0.0, lin_n=0):
     """Phased-hardening temperature: [0, end_frac*iters) split into `cycles` cosine anneals, each
     from a decaying reheat peak down to v1; holds v1 after. Each cycle is a full election + a
@@ -1059,6 +1065,101 @@ def parse_args():
                    help="quantize fg/bg to N k-means colors (straight-through). 0 = continuous; "
                         "emission snaps to ANSI regardless")
     p.add_argument("--output-ans", default=None, help="(color) write an ANSI-colored .ans")
+    # NB the --color-lite-* defaults are what `unicasso.lite` ships for the v2
+    # models (blend read, ridge 1.0), so `--color-lite CKPT` alone colours the
+    # run exactly as the lite model would; the trainer passes them explicitly.
+    p.add_argument("--color-lite", default=None, metavar="CKPT",
+                   help="COLOR FROM THE LITE MODEL: fg/bg come from the distilled "
+                        "mask decoder instead of the closed-form MSE fit, so the run "
+                        "optimizes toward colors the lite model can actually reproduce "
+                        "and the refined grid is color-aware by construction. fg/bg "
+                        "stay out of the optimizer (detached lookups, never leaves)")
+    p.add_argument("--color-lite-mode", default="birth",
+                   choices=["emit", "birth", "forward"],
+                   help="how far the lite coloring reaches: 'emit' = probe renders + "
+                        "emission only (candidates MEASURED in the model's colors); "
+                        "'birth' = + per-slot colors set at init/birth/reseed, so the "
+                        "soft render, the probe and emission all agree (default); "
+                        "'forward' = + re-queried every forward from each slot's "
+                        "current nearest glyph, so colors track slots as they travel")
+    p.add_argument("--color-lite-ink", default="render",
+                   choices=["render", "center"],
+                   help="what goes in the ink channel of the color query: 'render' = "
+                        "the whole 5x3 window rendered from the current grid (what "
+                        "lite._masks does and what mode 2 was TRAINED on -- in-"
+                        "distribution, but a cell's colors then depend on its "
+                        "neighbours); 'center' = the photo's own ink everywhere with "
+                        "only the center cell replaced by the candidate glyph, making "
+                        "colors a pure function of (cell, glyph) -- permanently "
+                        "cacheable, one cell requeried per probe, but no current "
+                        "checkpoint has been trained on it")
+    p.add_argument("--color-lite-font", default=None, choices=["dejavu", "sfmono"])
+    p.add_argument("--color-lite-path", default="blend",
+                   choices=["topk", "sample", "blend"],
+                   help="mask read for the color query. 'blend' = every pixel "
+                        "weighted by its probability (mask_fit), which is what "
+                        "the trainer uses under --read-path blend; keep them "
+                        "matched or the pool is refined through a read the "
+                        "model was not trained under")
+    p.add_argument("--color-lite-frac", type=float, default=0.25)
+    p.add_argument("--color-lite-count", default="argmax",
+                   choices=["fixed", "argmax"])
+    p.add_argument("--color-lite-temp", type=float, default=1.0,
+                   help="(--color-lite-path sample) draw temperature")
+    p.add_argument("--color-lite-ridge", type=float, default=1.0)
+    p.add_argument("--color-lite-chunk", type=int, default=512,
+                   help="windows per lite-color forward. The full (n,4,116,96) "
+                        "batch is never materialized -- this caps the transient "
+                        "allocation (512 ~ 90MB; the whole M*K batch at w60 "
+                        "would be 1.3GB, reallocated every step in forward mode)")
+    p.add_argument("--color-lite-k-scale", type=float, default=0.0,
+                   help="learned per-cell contrast in the lite coloring: "
+                        "k = 1 + k_scale*(k_hat - 1). DEFAULT 0 = the k head is "
+                        "not used at all -- it was trained against the soft "
+                        "mask-weighted mean, is uncorrelated with fit separation "
+                        "under the selection read, and can satisfy separation "
+                        "constraints by itself. 1.0 applies it as trained; the "
+                        "knob exists so its absence can be A/B'd, not assumed")
+    p.add_argument("--color-mask", default=None,
+                   help="(color, swarm) FROZEN-MASK coloring: npz with per-cell "
+                        "fg/bg pixel masks (masks (M,>=2,CH,CW), gh, gw -- e.g. "
+                        "lite --dump-masks). fg/bg are computed ONCE as the "
+                        "mask-weighted fit on the target cells and held constant: "
+                        "colors are glyph-independent, the run arbitrates shape "
+                        "only (the EM E-step). Overrides --color-fit")
+    p.add_argument("--color-mask-mode", default="frozen",
+                   choices=["frozen", "init"],
+                   help="frozen = mask-fit colors held constant (pure shape "
+                        "arbitration). init = colors WARM-STARTED from the "
+                        "mask fit then left FREE under CLIP/recon -- the "
+                        "engine optimizes colors directly (no softmax in the "
+                        "path) and the refined colors become dense mask "
+                        "supervision for the M-step")
+    p.add_argument("--color-mask-ridge", type=float, default=1.0,
+                   help="pixel-mass ridge toward the cell mean for low-mass "
+                        "layers in the frozen-mask fit")
+    p.add_argument("--color-init", default=None,
+                   help="(color) NPZ with per-cell fg/bg (M,3) to seed the free color "
+                        "leaves, instead of the engine's own per-slot closed-form re-fit. "
+                        "Use it to start a refine at the colors the LITE model actually "
+                        "shipped. Overridden by --color-pin / --color-mask")
+    p.add_argument("--color-anchor", type=float, default=0.0,
+                   help="cosine-ramped L2 pulling the FREE fg/bg leaves toward the closed-form "
+                        "distance-weighted MSE fit of the placed glyphs; regularizes CLIP-"
+                        "degenerate colors on cells CLIP ignores. This is the END weight (the "
+                        "value at --color-anchor-end-frac); >0 also arms the schedule")
+    p.add_argument("--color-anchor-start", type=float, default=0.0,
+                   help="anchor weight at --color-anchor-start-frac (the START value; default 0). "
+                        "The weight cosine-ramps from here to --color-anchor over the fraction "
+                        "window, holding flat outside it")
+    p.add_argument("--color-anchor-start-frac", type=float, default=0.0,
+                   help="run fraction (of the schedule length) where the ramp BEGINS; before "
+                        "this the weight is pinned at --color-anchor-start (default 0.0)")
+    p.add_argument("--color-anchor-end-frac", type=float, default=1.0,
+                   help="run fraction where the ramp REACHES --color-anchor; after this the "
+                        "weight is pinned at --color-anchor (default 1.0)")
+    p.add_argument("--color-anchor-mc", type=float, default=0.12,
+                   help="min-contrast luminance floor applied to the color-anchor target fit")
     p.add_argument("--recolor", action="store_true", default=True,
                    help="(color, DEFAULT ON) post-step: refit fg/bg by closed-form MSE against the "
                         "original at the placed glyphs, and ship that as *_mserefit.png/.ans")
@@ -1132,6 +1233,12 @@ def parse_args():
                         "z0 = codebook[glyph] per cell. E.g. seed pool mode with a knn-smooth result "
                         "(the two-stage pipeline: coherent global solution -> local repair). Grid must "
                         "match --base-width/height and the charset (incl. bans)")
+    p.add_argument("--init-w-lead", type=float, default=0.0,
+                   help="(swarm) extra W handed to slot 0 -- the warm-start hypothesis -- at init, "
+                        "before the spread cap projects the gaps. With --swarm-w-cap 0.5 and K=3, "
+                        "~1.0 saturates the cap: the strongest expressible lead a rival can still "
+                        "contest. Pairs with --init-text to TRUST a previous result (e.g. a lite-"
+                        "model grid) instead of merely starting from it")
     p.add_argument("--init-scan", action="store_true",
                    help="warm-start each cell at its ORACLE glyph: dense integer-shift sweep of the "
                         "whole image (+/- --init-scan-range px), ink-preserving views only, blanks "
@@ -1267,7 +1374,13 @@ def main():
             print(f"pool mode: z-based flags ignored: {', '.join(inactive)}")
     pad, codebook, model, L = (0, 0), None, None, None
     if uses_vae:
-        model, vae_chars, L, pad = load_vae(args.vae_ckpt, device)
+        if os.environ.get("ASCIIFY_PERSIST"):     # persistent E-step workers
+            key = ("vae", args.vae_ckpt, str(device))
+            if key not in _PERSIST:
+                _PERSIST[key] = load_vae(args.vae_ckpt, device)
+            model, vae_chars, L, pad = _PERSIST[key]
+        else:
+            model, vae_chars, L, pad = load_vae(args.vae_ckpt, device)
 
     ink, chars = G.load_glyphs(device=device, pad=pad)  # sets train.CHARS + fonts
     if uses_vae:
@@ -1425,6 +1538,7 @@ def main():
     swarm = None
     sw_temp_lut = None     # (N,) per-glyph density temp multiplier (swarm per-slot blend temps)
     z = None
+    knn_z_init = knn_z_hist = knn_hist_it = None
     if uses_vae:
         if args.random_init:
             z0 = torch.randn(M, L, device=device) * 0.1
@@ -1541,6 +1655,12 @@ def main():
                                             single=args.swarm_init_single)
                 if args.swarm_init_single:
                     print("swarm: single-slot init (slots 1+ start FREE; membership earned by births)")
+                if args.init_w_lead:
+                    # Trust the warm start: slot 0 enters with a lead in raw W units. The
+                    # spread-cap projection below keeps it expressible-but-contestable;
+                    # empty-seeded cells already hold a decisive +3 and are closed anyway.
+                    swarm.W.data[:, 0] += args.init_w_lead
+                    print(f"init-w-lead: slot 0 starts +{args.init_w_lead:g} W ahead")
                 host = swarm
             host.space_idx = space_i                       # never evicted (the escape hatch)
             if not pool_mode and args.swarm_empty_pin > 0 and empty_safe is not None \
@@ -1775,11 +1895,105 @@ def main():
                         print(f"color: quantizing fg/bg to {pal.shape[0]} palette entries (STE)")
                     sg0, _ = swarm.slot_glyphs(codebook)                  # (M,K) seeded glyphs
                     swarm.fit_slot_colors(1.0 - bm_flat[sg0])
+                    if args.color_init:
+                        # start the free leaves at the colors the LITE model actually
+                        # SHIPPED (its own recipe: cluster blend + distance-weighted fit
+                        # + k-hat), not the engine's plainer per-slot re-fit. Makes
+                        # --refine a true polish of the lite output instead of a
+                        # re-derivation, and puts the anchor's drift metric on a
+                        # meaningful zero.
+                        zi = np.load(args.color_init)
+                        ifg = torch.from_numpy(np.asarray(zi["fg"], np.float32)) \
+                            .to(device).view(-1, 3)
+                        ibg = torch.from_numpy(np.asarray(zi["bg"], np.float32)) \
+                            .to(device).view(-1, 3)
+                        if ifg.shape[0] != M or ibg.shape[0] != M:
+                            raise ValueError(
+                                f"--color-init has {ifg.shape[0]} cells, grid has "
+                                f"M={M} (same width/font as the lite render?)")
+                        swarm.fg.data.copy_(ifg[:, None, :].expand(M, swarm.K, 3))
+                        swarm.bg.data.copy_(ibg[:, None, :].expand(M, swarm.K, 3))
+                        print(f"color: --color-init -> fg/bg seeded from {args.color_init} "
+                              f"(lite's shipped colors, all {swarm.K} slots)")
                     color_fg0 = swarm.fg.data.clone()                     # closed-form init, for
                     color_bg0 = swarm.bg.data.clone()                     # the end-of-run drift report
-                    if args.color_pin:
+                    if args.color_lite:
+                        from unicasso.engine.lite_color import LiteColorer
+                        swarm.lite_colorer = LiteColorer(
+                            args.color_lite, args.input_image, GH, GW, device=device,
+                            font=args.color_lite_font, ink=args.color_lite_ink,
+                            read=dict(color_path=args.color_lite_path,
+                                      frac=args.color_lite_frac,
+                                      count=args.color_lite_count,
+                                      temp=args.color_lite_temp,
+                                      ridge=args.color_lite_ridge),
+                            k_scale=args.color_lite_k_scale,
+                            chunk=args.color_lite_chunk)
+                        swarm.lite_mode = args.color_lite_mode
+                        swarm.lite_grid = swarm.snap(codebook)
+                        if args.color_lite_mode in ("birth", "forward"):
+                            swarm.fit_slot_colors(1.0 - bm_flat[sg0], glyphs=sg0)
+                        print(f"color: --color-lite {args.color_lite} "
+                              f"(mode {args.color_lite_mode}, ink "
+                              f"{args.color_lite_ink}, read "
+                              f"{args.color_lite_path} frac {args.color_lite_frac:g} "
+                              f"count {args.color_lite_count}) -> fg/bg from the "
+                              f"distilled mask decoder, NOT optimized")
+                    elif args.color_pin:
                         swarm.fg.data.zero_(); swarm.bg.data.fill_(1.0)
                         print("color: --color-pin -> fg=black/bg=white (grayscale control arm)")
+                    elif args.color_mask:
+                        # FROZEN-MASK coloring (EM E-step): fg/bg = the mask-
+                        # weighted fit on the target cells, computed once and
+                        # held constant across the whole run. Colors belong to
+                        # the content, not the glyph: every slot in a cell
+                        # carries the same pair, W arbitrates pure shape, and
+                        # fg/bg stay OUT of param_groups.
+                        zm = np.load(args.color_mask)
+                        pm = torch.from_numpy(np.asarray(zm["masks"],
+                                                         np.float32)).to(device)
+                        if pm.shape[0] != M or pm.shape[-2:] != (CH, CW):
+                            raise ValueError(
+                                f"--color-mask masks {tuple(pm.shape)} do not match "
+                                f"grid M={M} cell {CH}x{CW} (same width/font?)")
+                        tgt_c = swarm.tgt_cell_rgb                     # (M,P,3)
+                        meanc = tgt_c.mean(1)
+                        rid = args.color_mask_ridge
+                        pf = pm[:, 0].reshape(M, -1)
+                        pb = pm[:, 1].reshape(M, -1)
+                        fgm = ((pf[..., None] * tgt_c).sum(1) + rid * meanc) \
+                            / (pf.sum(1, keepdim=True) + rid)
+                        bgm = ((pb[..., None] * tgt_c).sum(1) + rid * meanc) \
+                            / (pb.sum(1, keepdim=True) + rid)
+                        if "k" in zm.files:            # lite k rides the masks
+                            kv = torch.from_numpy(np.asarray(zm["k"], np.float32)) \
+                                .to(device).view(M, 1)
+                            midm = 0.5 * (fgm + bgm)
+                            fgm = (midm + kv * (fgm - midm)).clamp(0, 1)
+                            bgm = (midm + kv * (bgm - midm)).clamp(0, 1)
+                        K_ = swarm.fg.shape[1]
+                        swarm.fg.data.copy_(fgm[:, None, :].expand(M, K_, 3))
+                        swarm.bg.data.copy_(bgm[:, None, :].expand(M, K_, 3))
+                        if args.color_mask_mode == "init":
+                            _clr = args.lr if args.color_lr is None else args.color_lr
+                            param_groups.append({"params": [swarm.fg, swarm.bg],
+                                                 "lr": _clr})
+                            print(f"color: --color-mask-mode init -> colors warm-"
+                                  f"started from {args.color_mask}, FREE under "
+                                  f"CLIP/recon (lr {_clr:g})")
+                            if args.color_anchor > 0:
+                                from unicasso.engine.color import glyph_bg_dist
+                                swarm._anchor_bgdist = glyph_bg_dist(1.0 - bm_flat, CH, CW)
+                                swarm._anchor_w = args.color_anchor
+                                swarm._anchor_mc = args.color_anchor_mc
+                                swarm._anchor_fg = swarm._anchor_bg = None
+                                print(f"color: --color-anchor {args.color_anchor:g} -> cosine-"
+                                      f"ramped L2 to closed-form distwt fit "
+                                      f"(mc {args.color_anchor_mc:g})")
+                        else:
+                            print(f"color: --color-mask -> frozen mask-fit colors from "
+                                  f"{args.color_mask} (ridge {rid:g}"
+                                  + (", k applied" if "k" in zm.files else "") + ")")
                     elif args.color_fit:
                         # colors are a FUNCTION of the ink now: there are no leaves left to
                         # optimize, so fg/bg deliberately stay OUT of param_groups
@@ -1814,6 +2028,30 @@ def main():
                     else:
                         _clr = args.lr if args.color_lr is None else args.color_lr
                         param_groups.append({"params": [swarm.fg, swarm.bg], "lr": _clr})
+                        if args.color_anchor > 0:
+                            # free CLIP colors, but cosine-ramp them back toward the
+                            # closed-form fit of the placed glyphs late in the run.
+                            # Mask-independent: works on the k-hat (no-mask) model too.
+                            from unicasso.engine.color import glyph_bg_dist
+                            swarm._anchor_bgdist = glyph_bg_dist(1.0 - bm_flat, CH, CW)
+                            swarm._anchor_w = args.color_anchor
+                            swarm._anchor_mc = args.color_anchor_mc
+                            swarm._anchor_fg = swarm._anchor_bg = None
+                            print(f"color: --no-color-fit + --color-anchor "
+                                  f"{args.color_anchor:g} -> free fg/bg, cosine-ramped "
+                                  f"L2 to the closed-form fit (mc {args.color_anchor_mc:g})")
+                    if args.color_anchor > 0 and not hasattr(swarm, "_anchor_w"):
+                        _mode = ("--color-pin" if args.color_pin else
+                                 f"--color-mask (mode {args.color_mask_mode})"
+                                 if args.color_mask else "--color-fit (the DEFAULT)")
+                        raise SystemExit(
+                            f"--color-anchor {args.color_anchor:g} is a NO-OP under "
+                            f"{_mode}: the anchor pulls the FREE fg/bg leaves toward the "
+                            f"closed-form fit, but in this mode fg/bg are not optimizer "
+                            f"parameters at all (under --color-fit the shipped colors ARE "
+                            f"already the closed-form fit, so there is nothing to anchor).\n"
+                            f"Use one of:  --no-color-fit  (free colors, fit-anchored)\n"
+                            f"             --color-mask FILE --color-mask-mode init")
                 param_groups.append({"params": [swarm.z], "lr": args.lr})
                 param_groups.append({"params": [swarm.W], "lr": args.lr,
                                      "weight_decay": args.swarm_w_decay,
@@ -1836,6 +2074,10 @@ def main():
         else:
             z = nn.Parameter(z0.clone())
             param_groups.append({"params": [z], "lr": args.lr})
+            # displacement diagnostics (--pool-record in knn-smooth mode): init latents
+            # + sampled z trajectory, so late-run mobility can be measured after the run
+            knn_z_init = z0.detach().clone() if args.pool_record else None
+            knn_z_hist, knn_hist_it = ([], []) if args.pool_record else (None, None)
 
     opt = torch.optim.AdamW(param_groups)
 
@@ -1905,7 +2147,24 @@ def main():
             print(f"Loading CLIP ({args.clip_model}) for CLIPasso perceptual loss...")
             vit_layers = tuple((int(t.split(":")[0]), float(t.split(":")[1]) if ":" in t else 1.0)
                                for t in args.clip_vit_layers.split(","))   # 'idx' or 'idx:weight' pairs
-            clipper = CLIPPerceptualLoss(device, model_name=args.clip_model, pretrained=args.clip_pretrained,
+            ck_ = ("clipper", args.clip_model, args.clip_pretrained, args.clip_aug,
+                   args.clip_semantic_weight, tuple(args.clip_crop_scale),
+                   args.clip_rotate, args.clip_shear, args.clip_invert_frac,
+                   args.clip_scale_alpha, tuple(args.clip_aspect_jitter),
+                   args.clip_edge_frac, args.clip_edge_beta, args.clip_edge_auto,
+                   vit_layers, args.clip_vit_drop_cls, args.clip_fp16,
+                   args.clip_adapter, args.clip_batch_aug, args.clip_reg_frac,
+                   CH, CW, args.clip_microbatch, args.clip_steer,
+                   args.clip_steer_weight, str(device))
+            if os.environ.get("ASCIIFY_PERSIST") and ck_ in _PERSIST:
+                clipper = _PERSIST[ck_]
+                # target-derived caches are PER-IMAGE: a reused worker instance
+                # must not carry the previous job's dense target maps. The
+                # recompute guard is _dense_key -- clear THAT (clearing only
+                # _dense_tgt leaves the key matched and crashes on None)
+                clipper._dense_key = None
+            else:
+                clipper = CLIPPerceptualLoss(device, model_name=args.clip_model, pretrained=args.clip_pretrained,
                                          n_aug=args.clip_aug, fc_weight=args.clip_semantic_weight,
                                          crop_scale=tuple(args.clip_crop_scale),
                                          rotate_deg=args.clip_rotate, shear_deg=args.clip_shear,
@@ -1919,6 +2178,8 @@ def main():
                                          batch_aug=args.clip_batch_aug,
                                          reg_frac=args.clip_reg_frac, cell_h=CH, cell_w=CW, microbatch=args.clip_microbatch,
                                          steer=args.clip_steer, steer_weight=args.clip_steer_weight)
+                if os.environ.get("ASCIIFY_PERSIST"):
+                    _PERSIST[ck_] = clipper
             if args.clip_reg_frac > 0:
                 print(f"  crop registration ON: target crops nudged up to +/-{args.clip_reg_frac} cell "
                       f"({int(round(args.clip_reg_frac * CW))}x{int(round(args.clip_reg_frac * CH))}px)")
@@ -2662,6 +2923,49 @@ def main():
             g_orient_unit = (torch.autograd.grad(orient, img, retain_graph=True)[0][0]
                              if (args.orient_weight > 0 and img_rgb is None) else None)
 
+        if getattr(swarm, "_anchor_w", 0.0) > 0:
+            import math as _math
+            # scheduled anchor weight: cosine-ramp v0 -> v1 over [f0, f1] of the run,
+            # held flat outside the window. v1 = --color-anchor, v0 = --color-anchor-start.
+            _v1 = swarm._anchor_w
+            _v0 = args.color_anchor_start
+            _f0 = args.color_anchor_start_frac
+            _f1 = args.color_anchor_end_frac
+            _prog = min(1.0, max(0.0, (it / max(1, sched_iters) - _f0) / max(1e-6, _f1 - _f0)))
+            _ease = 0.5 * (1.0 - _math.cos(_math.pi * _prog))
+            _aw = _v0 + (_v1 - _v0) * _ease
+            if _aw > 0 and (it % 10 == 0 or swarm._anchor_fg is None):
+                with torch.no_grad():
+                    _gi = swarm.snap(codebook)
+                    _mask = (1.0 - char_bitmaps[_gi]).reshape(M, -1)
+                    _bw = swarm._anchor_bgdist[_gi]
+                    from unicasso.engine.color import fit_fg_bg
+                    _af, _ab = fit_fg_bg(swarm.tgt_cell_rgb, _mask, 1e-3, bg_w=_bw)
+                    _mc = swarm._anchor_mc
+                    if _mc > 0:
+                        _lf = 0.299 * _af[:, 0] + 0.587 * _af[:, 1] + 0.114 * _af[:, 2]
+                        _lb = 0.299 * _ab[:, 0] + 0.587 * _ab[:, 1] + 0.114 * _ab[:, 2]
+                        _gap = _lf - _lb
+                        _push = torch.where(_gap <= 0, -1.0, 1.0) * (_mc - _gap.abs()).clamp_min(0)
+                        _af = _af + _push[:, None]
+                    swarm._anchor_fg, swarm._anchor_bg = _af, _ab
+            if _aw > 0 and swarm._anchor_fg is not None:
+                _la = (swarm.fg - swarm._anchor_fg[:, None, :]).pow(2).mean() \
+                    + (swarm.bg - swarm._anchor_bg[:, None, :]).pow(2).mean()
+                loss = loss + _aw * _la
+                if args.progress_every and it % args.progress_every == 0:
+                    # observability: is the pull actually closing the gap?
+                    with torch.no_grad():
+                        # per-CELL drift; degeneracy is a TAIL phenomenon, so report
+                        # the tail (p95/max) alongside the mean, not the mean alone
+                        _pc = 0.5 * ((swarm.fg.mean(1) - swarm._anchor_fg).abs().mean(-1)
+                                     + (swarm.bg.mean(1) - swarm._anchor_bg).abs().mean(-1))
+                        _d, _p95, _mx = _pc.mean(), _pc.quantile(0.95), _pc.max()
+                        _nbad = int((_pc > 0.25).sum())
+                    print(f"  anchor: w={_aw:.4g} (v0={_v0:g} -> v1={_v1:g} over "
+                          f"[{_f0:g},{_f1:g}])  |fg/bg - fit| mean={float(_d):.4f} "
+                          f"p95={float(_p95):.4f} max={float(_mx):.4f} "
+                          f"n>0.25={_nbad}  L2={float(_la):.5f}", flush=True)
         loss.backward()
         opt.step()
         if swarm_mode and args.color and not args.color_pin:
@@ -3239,6 +3543,11 @@ def main():
                         (swarm.g_ema.mean(1) if swarm.g_ema is not None
                          else torch.zeros(M, device=device)).cpu().numpy().astype(np.float32))
 
+        if knn_z_hist is not None and it % args.pool_record_interval == 0:
+            with torch.no_grad():
+                knn_hist_it.append(it)
+                knn_z_hist.append(z.detach().cpu().numpy().astype(np.float32))
+
         if es_break:
             skipped_es = args.iters - it - 1
             reason = (f"colour-contrast budget of {args.color_contrast_iters} iters done"
@@ -3345,7 +3654,8 @@ def main():
             # A failed QR must never lose a finished render.
             print(f"QR generation failed ({type(e).__name__}): {e}")
 
-    if args.color and swarm_mode and not args.color_pin and not args.color_fit:
+    if args.color and swarm_mode and not args.color_pin and not args.color_fit \
+            and not args.color_mask:
         # How far did CLIP/recon actually MOVE the colors off their closed-form MSE init? If this
         # is ~0 the color leaves are inert and the run is just a post-hoc colorizer with extra steps.
         with torch.no_grad():
@@ -3505,6 +3815,20 @@ def main():
                  if live_probe else "")
               + (f" | boosts {n_boosts}, merges {n_merges}, lottery births {n_lottery}"
                  if swarm_mode else ""))
+    elif args.pool_record and args.mode == "knn-smooth":
+        # slim displacement record: init/final latents + codebook, for the
+        # staleness figure (how far does a single-latent cell travel from init?)
+        import os as _os
+        _os.makedirs(_os.path.dirname(args.pool_record) or ".", exist_ok=True)
+        np.savez(args.pool_record, GH=GH, GW=GW, chars=np.array(list(chars)),
+                 mode=np.array(args.mode),
+                 z_init=knn_z_init.cpu().numpy().astype(np.float32),
+                 z_final=z.detach().cpu().numpy().astype(np.float32),
+                 z_hist=np.array(knn_z_hist, dtype=np.float32),   # (T, M, L)
+                 hist_it=np.array(knn_hist_it, dtype=np.int32),
+                 codebook=codebook.cpu().numpy().astype(np.float32),
+                 final_snap=idx.cpu().numpy())
+        print(f"wrote knn-smooth displacement record -> {args.pool_record}")
 
     if args.output_indices:
         # self-describing training target: indices index into `chars` (codebook order, after banning)

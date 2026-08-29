@@ -83,6 +83,17 @@ class ParticleSwarm:
         self.color_fit_mc = 0.0          # in-loop legibility floor (= recolor's --min-contrast)
         self.color_fit_ridge = 1e-3
         self.color_fit_detach = False    # True -> colors track the shape but pass no gradient back
+        # LITE COLORING: fg/bg come from the distilled mask decoder instead of the
+        # closed-form fit, so the engine optimizes toward colors the lite model can
+        # actually reproduce. `lite_mode` selects how far it reaches:
+        #   'emit'    -- probe renders + emission only
+        #   'birth'   -- + per-slot colors at init/birth/reseed (constants)
+        #   'forward' -- + re-queried every forward from each slot's nearest glyph
+        # Always detached: nothing differentiates through the lite model.
+        self.lite_colorer = None
+        self.lite_mode = None
+        self.lite_grid = None            # (M,) current snap: the 'render' ink context
+        self._lite_prev_g = None         # (M,K) last forward's slot glyphs
         self.color_bg_dist = None        # (N,P) per-glyph bg-distance table (color.glyph_bg_dist)
         self.color_bg_dist_pow = 0.0     # bg votes ~ dist^pow from the glyph's ink; 0 = plain fit
         self.cluster_fg = None           # (M,3) decompose cluster colors -- blended into the fit
@@ -326,6 +337,12 @@ class ParticleSwarm:
         birth) while the loop had been optimizing against freshly fitted colors, so the shipped
         .ans would not be the image that was optimized. Same fit, same floor, same palette.
         gidx (M,): placed glyph indices, for the bg-distance weighting."""
+        if self.lite_colorer is not None and gidx is not None:
+            # every lite mode substitutes here: this is BOTH the probe's
+            # counterfactual render and emission, so candidates are measured in
+            # the same colors the run will ship
+            cells = torch.arange(gidx.shape[0], device=gidx.device)
+            return self.lite_colorer.query(cells, gidx, grid=gidx)
         from unicasso.engine.color import fit_fg_bg
         bg_w = None
         if self.color_bg_dist is not None and self.color_bg_dist_pow > 0 and gidx is not None:
@@ -345,12 +362,38 @@ class ParticleSwarm:
         return fg, bg
 
     @torch.no_grad()
-    def fit_slot_colors(self, masks, cells=None, slots=None, ridge=1e-3):
+    def fit_slot_colors(self, masks, cells=None, slots=None, ridge=1e-3,
+                        glyphs=None):
         """Closed-form fg/bg for given ink masks -- the init at seed/birth/reseed.
         masks (n,P) ink (1 = glyph ink). cells/slots (n,) index the slots to write;
-        None/None means "all slots", masks then (M,K,P)."""
+        None/None means "all slots", masks then (M,K,P).
+
+        Under lite_mode 'birth'/'forward' and with `glyphs` given, the colors come
+        from the lite model instead: a candidate is then born carrying the colors
+        it would actually ship, which is the whole point of asking at proposal
+        time -- a glyph that only wins on color is otherwise judged through the
+        evictee's palette."""
         if self.tgt_cell_rgb is None:
             return
+        if (self.lite_colorer is not None and glyphs is not None
+                and self.lite_mode in ("birth", "forward")):
+            need_grid = self.lite_colorer.ink_mode == "render"
+            if not need_grid or self.lite_grid is not None:
+                if cells is None:                      # all slots: (M,K) -> flat
+                    cq = self._ar.repeat_interleave(self.K)
+                    gq = glyphs.reshape(-1)
+                else:
+                    cq, gq = cells, glyphs
+                fg, bg = self.lite_colorer.query(cq, gq, grid=self.lite_grid)
+                if cells is None:
+                    self.fg.data.copy_(fg.view(self.M, self.K, 3))
+                    self.bg.data.copy_(bg.view(self.M, self.K, 3))
+                else:
+                    self.fg.data[cells, slots] = fg
+                    self.bg.data[cells, slots] = bg
+                return
+        if masks is None:        # lite-only call (forward mode) that could not be
+            return               # served -- there is no closed-form fallback for it
         from unicasso.engine.color import fit_fg_bg
         if cells is None:
             M, K = self.M, self.K
@@ -423,8 +466,34 @@ class ParticleSwarm:
             # cell_rgb[m,p] = sum_k v_k * ( bg_k + (fg_k - bg_k) * ink_k[p] ),  ink = 1 - slot_img
             # Never materialize slot_rgb (M,K,P,3) -- at M=1800,K=3 that is 42MB/forward and it
             # scales with the grid; the two einsums below give (M,P,3) straight out.
-            fg, bg = (self._fit_colors(slot_img, idxk[:, 0].view(M, K)) if self.color_fit
-                      else self._colors())                             # (M,K,3) each
+            if self.lite_colorer is not None and self.lite_mode == "forward":
+                if self.lite_colorer.ink_mode == "render":
+                    # the current hard grid, straight off this forward's own
+                    # argmax -- no extra cdist, and always in step with v
+                    self.lite_grid = idxk[:, 0].view(M, K).gather(
+                        1, v.argmax(1, keepdim=True)).squeeze(1)
+                # colors track the slots as they travel: each slot is colored as
+                # its CURRENT nearest glyph would be. Detached -- the lite model
+                # is a lookup, not a term in the loss.
+                sg_ = idxk[:, 0].view(M, K)
+                # only slots whose GLYPH actually moved need a new color. Most
+                # slots sit still between iterations, so this turns a full
+                # M*K query every forward into a handful -- the difference
+                # between re-running the colorizer on the whole grid each step
+                # and touching only what changed.
+                if self._lite_prev_g is None:
+                    ch_ = torch.ones_like(sg_, dtype=torch.bool)
+                else:
+                    ch_ = sg_ != self._lite_prev_g
+                if ch_.any():
+                    cidx = ch_.nonzero(as_tuple=False)
+                    self.fit_slot_colors(None, cidx[:, 0], cidx[:, 1],
+                                         glyphs=sg_[ch_])
+                self._lite_prev_g = sg_.clone()
+                fg, bg = self._colors()
+            else:
+                fg, bg = (self._fit_colors(slot_img, idxk[:, 0].view(M, K)) if self.color_fit
+                          else self._colors())                         # (M,K,3) each
             ink = 1.0 - slot_img                                         # (M,K,P)
             dcol = fg - bg                                               # (M,K,3)
             vb = (v[:, :, None] * bg).sum(1)                             # (M,3)
@@ -457,7 +526,10 @@ class ParticleSwarm:
         l = self.W.data if self.h_bias is None else self.W.data + self.h_bias
         k = l.masked_fill(self.free, float("-inf")).argmax(dim=1)
         zw = self.z.data[self._ar, k]
-        return torch.cdist(zw, codebook).argmin(dim=1)
+        g = torch.cdist(zw, codebook).argmin(dim=1)
+        if self.lite_colorer is not None:
+            self.lite_grid = g            # 'render' ink context, kept current
+        return g
 
     # ---------------------------------------------------------------- housekeeping
     @torch.no_grad()
@@ -871,7 +943,8 @@ class ParticleSwarm:
         if self.color_on and self.bm_flat is not None:
             # fit the arrival's OWN colors: inheriting the evictee's pair would judge a new
             # glyph through the old one's palette and lose contenders that only differ in color
-            self.fit_slot_colors(1.0 - self.bm_flat[glyphs], c, slots)
+            self.fit_slot_colors(1.0 - self.bm_flat[glyphs], c, slots,
+                                 glyphs=glyphs)
 
     @torch.no_grad()
     def purge_to_winner(self, codebook, it, avoid=None, keep=1, reseed=1):
@@ -917,7 +990,8 @@ class ParticleSwarm:
                 self.v_ema[c, slot[c]] = 0.0
                 self.last_boost[c, slot[c]] = it
                 if self.color_on and self.bm_flat is not None:
-                    self.fit_slot_colors(1.0 - self.bm_flat[g[c]], c, slot[c])
+                    self.fit_slot_colors(1.0 - self.bm_flat[g[c]], c, slot[c],
+                                         glyphs=g[c])
                 cs.append(c); ks.append(slot[c])
         if cs:
             return n_purged, torch.cat(cs), torch.cat(ks)
@@ -932,6 +1006,8 @@ class ParticleSwarm:
         still held real weight means eps is destroying live diversity, not recycling duplicates."""
         empty = (torch.zeros(0, dtype=torch.long, device=self.device),
                  torch.zeros(0, device=self.device), torch.zeros(0, device=self.device))
+        if self.K < 2:                     # K=1: no slot pairs to merge
+            return empty
         z = self.z.data
         dz = (z[:, :, None, :] - z[:, None, :, :]).norm(dim=-1)          # (M,K,K)
         K = self.K

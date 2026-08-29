@@ -351,7 +351,17 @@ class CLIPPerceptualLoss(nn.Module):
         x = ((batch - self.mean) / self.std).to(self._dtype)
         self._feats = {}
         fc = self.visual(x)
-        return fc, dict(self._feats)
+        out = dict(self._feats)
+        # DROP the instance's own references once the caller has its copy. The
+        # hooked outputs carry grad_fn, so holding them holds that entire CLIP
+        # backward graph -- and self._feats was only ever reassigned on the NEXT
+        # encode, which meant the last photo's graph stayed live indefinitely.
+        # Measured in the joint trainer at pool-refresh time: 4.58 GiB of live
+        # cuda tensors, almost all batch-32 RN101 feature maps, surviving every
+        # empty_cache() and squeezing the refinement workers. The returned dict
+        # holds everything the caller needs, so this is free.
+        self._feats = {}
+        return fc, out
 
     def _encode_split(self, ra, ta, aa=None):
         """Encode crop set(s) -> (fc, feats) in canonical layout [R(n) | T(n) | A(n)]
