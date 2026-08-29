@@ -1,32 +1,35 @@
-"""Joint trainer: three objectives, summed, one backward.
+"""Joint trainer for the distilled colour models: six loss arms, per-arm
+gradient normalisation, one curriculum.
 
-    L = w_line * CE_line  +  w_pool * CE_pool  +  lam * CLIP_mask
+    g_total = sum_i  w_i * g_i / EMA(||g_i||)          (+ a 5%-share regulariser channel)
 
-  CE_line   dense CE on the static lineart cache. The ANCHOR -- present in every
-            step, not sampled, because a regulariser that is absent from most
-            steps is not regularising. Its weight is fixed rather than grad-norm
-            balanced on purpose: if the colour objective starts degrading line
-            art, this term's gradient must be free to GROW and pull back. That
-            self-correcting feedback is the whole point, and normalising it away
-            would break it.
-  CE_pool   dense CE on engine-refined glyph grids from the rolling pool. The
-            pool's teacher colours with the model itself (--color-lite), so the
-            targets are reachable rather than aspirational.
-  CLIP_mask the only term that trains the mask decoder: crop a photo, sample
-            glyphs straight-through, colourise them through the mask, render,
-            and judge with the same CLIPasso objective the engine uses. With
-            probability --flip-frac the fg/bg colours are swapped -- explicit
-            exploration of the one degree of freedom (which cluster is
-            foreground) that the objective otherwise pins only weakly.
+  line_ce     glyph CE on the static lineart cache (the optimizer's own renders
+              of line drawings); main head at the window centre, auxiliary head
+              on the 14 neighbours at --aux-weight.
+  line_color  per-pixel CE of the mask (fg/bg/abstain) against the cache's TRUE
+              ink -- the mask-shape target. A reconstruction MSE cannot bootstrap
+              a random mask (the per-cell token bias saturates the softmax into a
+              cell-constant one-hot within ~100 steps); this can.
+  pool_line   glyph CE on a rolling pool of lineart grids refined by the full
+              optimizer, warm-started from this model (closed-form colours).
+  pool_color  glyph CE on a rolling pool of photo grids refined the same way,
+              coloured closed-form until --pool-color-switch and by this model
+              (--color-lite) after, so the targets are reachable.
+  clip        CLIP perceptual loss on photos: argmax glyphs straight-through,
+              coloured through the mask by the closed-form fit, rendered, judged
+              at --clip-aug random crops. The only photo-domain signal for shape.
+  mask_tgt    per-pixel CE of the mask against decompose's own fg/bg partition on
+              photos -- the POLARITY bootstrap. Injected by train_campaign.sh over
+              [1500, 2000) decaying to 0; in phase 0 it hardens the mask.
 
-lam is grad-norm calibrated against the CE terms IN THE SAME BACKWARD, so the
-ratio is measured on one graph instead of EMA'd across steps that saw different
-data and different weights.
+Every arm contributes exactly w_i in gradient norm whatever its natural scale
+(they differ by 30-100x); no weight depends on its own gradient. The weights per
+phase (CAMPAIGN_PHASES) sum to 1 so the effective LR is constant across
+hand-overs. --schedule flat holds the --w-* flags instead.
 
-Deleted relative to cellclf_color_train: every per-pixel mask target, the k head
-and all k terms, the decompose-derived priors (sep floor, structure, abstain,
-blur anchor, colour target/blend), the coltext / ansT / colorart arms, and all
-corruption paths.
+Deleted relative to cellclf_color_train: every decompose-derived prior, the k
+head and all k terms, the coltext / ansT / colorart arms, all corruption paths,
+and the grad-norm-ratio balancing (lam / w_pool / --balance).
 
     ./train_campaign.sh sfmono|dejavu            # from scratch, the full curriculum
     python -m unicasso.training.joint_train --init runs/joint/<run>/model.pt ...   # continue one
@@ -72,7 +75,7 @@ ROWS, COLS = 3, 5
 
 # ---------------------------------------------------------------- schedule
 # The campaign curriculum: one launch runs the whole thing. Each row is
-# (from_step, line_ce, line_color, pool_color, pool_line, clip).
+# (from_step, line_ce, line_color, pool_color, pool_line, clip, mask_tgt) -- ARMS order.
 #
 # Weights sum to 1.0 in every phase ON PURPOSE. Under per-arm gradient
 # normalisation each arm contributes exactly w_i in gradient norm, so the total
@@ -101,7 +104,8 @@ CAMPAIGN_LR_FACTOR = 0.667    # 3e-4 -> 2e-4, 0.02 -> 0.0133 (see --lr-late)
 CAMPAIGN_POOL_LINE_AT = 1000
 CAMPAIGN_POOL_COLOR_AT = 1500
 CAMPAIGN_REG_AT = 2500        # space/density ramp in here
-CAMPAIGN_MASK_TGT_OFF = 500   # phase-0 mask_tgt decays LINEARLY to 0 here
+CAMPAIGN_MASK_TGT_OFF = 500   # fallback decay horizon for a --w-mask-tgt (flat
+                              # schedule) run that gives no --mask-tgt-from/-until
 
 
 def phase_weights(step, phases):
@@ -229,37 +233,8 @@ def main():
                    default="data/color_images_plus,data/dataset_v1/photos")
     p.add_argument("--profile", default="sfmono")
     p.add_argument("--vae-ckpt", default="weights/vae_sfmono/model.pt")
-    p.add_argument("--name", default="joint01")
+    p.add_argument("--name", default="joint")
     # ---- objective weights
-    p.add_argument("--w-line", type=float, default=1.0,
-                   help="lineart CE weight -- FIXED, never recalibrated. The cache "
-                        "is static, so this term's gradient moves only when the "
-                        "model does; renormalising it would cancel the anchor's "
-                        "feedback (line art degrades -> gradient grows -> pull back)")
-    p.add_argument("--pool-ratio", type=float, default=1.0,
-                   help="target ||g_pool|| / ||g_line||. w_pool is re-derived every "
-                        "--recal-every steps to hold it: the pool's entries are "
-                        "replaced wholesale each refresh, so its loss scale really "
-                        "is non-stationary and does need renormalising. 1.0 = the "
-                        "pool carries the same gradient as the anchor")
-    p.add_argument("--clip-weight-target", type=float, default=0.2,
-                   help="target ||g_clip|| / ||g_ce||; lam is derived, not set")
-    p.add_argument("--balance", default="ce", choices=["ce", "photo"],
-                   help="which arm is the fixed reference the others are scaled "
-                        "to. 'ce' (inherited): w_line is pinned at 1 and lam = "
-                        "clip_weight_target * ||g_ce||/||g_clip||, so the photo "
-                        "arm's absolute push is proportional to the LINEART "
-                        "gradient -- it inherits lineart's crop-sampling noise, "
-                        "and it quiets down as lineart gets fit, which is "
-                        "backwards. 'photo': lam is pinned at 1 and the CE arms "
-                        "are scaled to ||g_clip|| instead, so the photo arm gets "
-                        "a stable absolute budget. TRADE-OFF: under 'photo' the "
-                        "lineart contribution is normalised to constant "
-                        "magnitude, which removes the anchor's self-correcting "
-                        "feedback (degrade lineart -> its gradient grows -> pull "
-                        "back). Raise --line-ratio to compensate")
-    p.add_argument("--line-ratio", type=float, default=1.0,
-                   help="(--balance photo) target ||w_line*g_line|| / ||g_clip||")
     p.add_argument("--line-regions", type=int, default=1,
                    help="lineart crops averaged into ONE anchor CE per step. 1 "
                         "is a batch of one region out of 254 runs and `line` "
@@ -290,8 +265,9 @@ def main():
     p.add_argument("--mask-tgt-from", type=int, default=None,
                    help="with --mask-tgt-until/-w: inject the mask_tgt arm at "
                         "weight W over [from, until) ON TOP of the schedule -- the "
-                        "other arms are scaled by (1-W) so the sum stays 1. For "
-                        "resuming a run that never had the bootstrap")
+                        "other arms are scaled by (1-W) so the sum stays 1, and "
+                        "W decays linearly to 0 at `until`. This is how the "
+                        "campaign runs the polarity bootstrap (1500 -> 2000)")
     p.add_argument("--mask-tgt-until", type=int, default=None)
     p.add_argument("--mask-tgt-w", type=float, default=0.0)
     p.add_argument("--w-mask-tgt", type=float, default=0.0,
@@ -300,7 +276,8 @@ def main():
                         "--mask-tgt-from/-until/-w instead)")
     p.add_argument("--lr-late", type=float, default=0.667,
                    help="multiply every LR group by this from --lr-late-step on. "
-                        "One step-down, no cosine: 3e-4 -> 2e-4 at the default")
+                        "One step-down (and no cosine with --lr-floor 1.0, as the "
+                        "campaign runs): 3e-4 -> 2e-4 at the default")
     p.add_argument("--lr-late-step", type=int, default=700)
     p.add_argument("--muon-lr-late", type=float, default=None,
                    help="late factor for the Muon group only (default: --lr-late). "
@@ -345,17 +322,20 @@ def main():
                         "DIRECTORY LISTING and silently changes when the photo "
                         "dir does -- local and the box already disagreed")
     p.add_argument("--pool-line", default=None,
-                   help="lineart pool dir (default runs/<name>/pool_line)")
+                   help="lineart pool dir (default runs/joint/<name>/pool_line)")
     p.add_argument("--pool-line-images", default="data/corpus/images",
                    help="source images for the lineart pool")
     p.add_argument("--pool-line-exclude", default=None,
                    help="cache meta.json whose val parents are EXCLUDED from "
                         "the lineart pool, or [val@] leaks")
-    p.add_argument("--recal-every", type=int, default=20)
+    p.add_argument("--recal-every", type=int, default=20,
+                   help="cadence unit of the EMA|g| / share diagnostic print "
+                        "(every 10 of these). Nothing is recalibrated any more")
     p.add_argument("--ratio-ema", type=float, default=0.2,
-                   help="EMA rate on the grad-norm RATIOS behind lam and w_pool. "
-                        "A single-region estimate is very noisy -- joint01 saw lam "
-                        "swing 3-12x between recalibrations. 1.0 = no smoothing")
+                   help="EMA rate on each arm's gradient-norm estimate (the "
+                        "denominator of the per-arm normalisation). A single-step "
+                        "estimate is very noisy -- the lineart arm's norm swings "
+                        "3-12x step to step. 1.0 = no smoothing")
     p.add_argument("--blank-weight", type=float, default=0.2)
     # ---- the shipped read (what the mask fit does at inference)
     p.add_argument("--read-path", default="sample",
@@ -373,9 +353,9 @@ def main():
     p.add_argument("--glyph-temp", type=float, default=0.0,
                    help="temperature for the straight-through glyph draw on the "
                         "photo arm. 0 = ARGMAX (default). >0 samples Gumbel at "
-                        "that temperature. Note photo_eval has always used "
-                        "argmax, so every [pval@] number was measured under a "
-                        "decode training did not use")
+                        "that temperature. photo_eval always uses argmax, so "
+                        "with >0 the [pval@] numbers measure a decode training "
+                        "did not use")
     p.add_argument("--read-frac", type=float, default=0.6)
     p.add_argument("--read-count", default="argmax", choices=["fixed", "argmax"])
     p.add_argument("--read-temp", type=float, default=0.3)
@@ -389,7 +369,8 @@ def main():
                         "otherwise share one token and let the decoder just copy "
                         "the glyph's shape")
     p.add_argument("--mask-l1", type=float, default=0.0,
-                   help="RUN B: L1 on committed mask mass (p_fg + p_bg). Punishes "
+                   help="LEGACY regulariser (rides the --reg-share channel; off in "
+                        "the campaign): L1 on committed mask mass (p_fg + p_bg). Punishes "
                         "overextension directly; CLIP is the counterweight, since "
                         "too much abstain collapses both colours to the cell mean")
     p.add_argument("--freeze-mask", action="store_true",
@@ -406,7 +387,8 @@ def main():
                         "objective cannot smooth the glyph stack's features. "
                         "Warm-started from the shared trunk's first conv")
     p.add_argument("--mask-entropy", type=float, default=0.0,
-                   help="penalty on the per-pixel 3-way entropy, pushing the mask "
+                   help="LEGACY regulariser (--reg-share channel; off in the "
+                        "campaign): penalty on the per-pixel 3-way entropy, pushing the mask "
                         "toward one-hot. Under a selection read only the ORDERING "
                         "of p is scored, so nothing otherwise rewards commitment "
                         "and the mask settles into a hedged ranking. CAUTION: this "
@@ -423,7 +405,10 @@ def main():
                         "much as with the model; this is the number that is "
                         "comparable across steps and across runs. 0 = off")
     p.add_argument("--mask-target", type=float, default=0.0,
-                   help="WARM-UP: dense per-pixel supervision of the mask "
+                   help="LEGACY (regulariser channel, so capped at --reg-share; it "
+                        "cannot bootstrap anything -- the campaign uses the "
+                        "mask_tgt ARM via --mask-tgt-from/-until/-w instead). "
+                        "Dense per-pixel supervision of the mask "
                         "against decompose's own partition, on the fg-vs-bg "
                         "CONDITIONAL only (abstain left free, so this is not "
                         "the em8 chain's full per-pixel copy). rgb_trunk never "
@@ -440,8 +425,9 @@ def main():
                         "Makes the fg/bg comparison multiplicative (a conv's "
                         "additive token cannot invert a spatial pattern) and "
                         "runs at full cell resolution. NOT surgery-safe -- the "
-                        "mask branch retrains from scratch, so pair it with "
-                        "--mask-target to bootstrap")
+                        "mask branch retrains from scratch; the campaign "
+                        "bootstraps it with the ink mask target (line_color) "
+                        "and the mask_tgt arm")
     p.add_argument("--mask-attn-dim", type=int, default=32,
                    help="(--mask-attn) pixel/query embedding width")
     p.add_argument("--mask-attn-depth", type=int, default=2,
@@ -458,26 +444,20 @@ def main():
     p.add_argument("--mask-attn-mid", type=int, default=None,
                    help="(--mask-attn) hidden width of that encoder "
                         "(default = --mask-attn-dim)")
-    p.add_argument("--line-color", type=float, default=0.0,
-                   help="weight on the lineart COLOUR-RECONSTRUCTION arm: paint "
-                        "the cache's true ink with a sampled fg/bg pair and ask "
-                        "the model to reproduce it. Exact and dense, unlike CLIP, "
-                        "and it trains the partition rather than the polarity "
-                        "convention")
     p.add_argument("--line-color-mse", type=float, default=0.0,
                    help="weight of the colour-reconstruction MSE inside the "
                         "line_color arm, on top of the ink mask CE. 0 = mask "
                         "target only (the campaign default)")
     p.add_argument("--line-color-frac", type=float, default=0.34,
-                   help="(--line-color) fraction of samples given a real colour "
+                   help="(line_color arm) fraction of samples given a real colour "
                         "pair; the rest stay ink-on-paper with a random "
                         "brightness ORDER, which is the black/white inversion")
     p.add_argument("--line-color-iso", type=float, default=0.34,
-                   help="(--line-color) fraction of the coloured samples made "
+                   help="(line_color arm) fraction of the coloured samples made "
                         "ISO-LUMINANT, so only hue and chroma separate the two "
                         "clusters and the brightness shortcut is unavailable")
     p.add_argument("--line-color-de", type=float, nargs=2, default=[15.0, 70.0],
-                   help="(--line-color) Lab dE range for the sampled pair; the "
+                   help="(line_color arm) Lab dE range for the sampled pair; the "
                         "floor sits above decompose's jnd=4")
     p.add_argument("--mask-ctx", action="store_true",
                    help="give the mask branch its OWN conv trunk over the RGB "
@@ -509,8 +489,8 @@ def main():
                         "glyph. Gated on an image property the model cannot "
                         "move, because ungated it is self-referential -- "
                         "'collapse the colours, then emit space' is a stable "
-                        "all-blank solution. Rides the regulariser channel, "
-                        "never lam")
+                        "all-blank solution. Rides the regulariser channel "
+                        "(--reg-share), never an arm weight")
     p.add_argument("--space-ramp", type=float, default=3.0,
                    help="(--space-weight) Lab peak-to-peak of the cell's fitted "
                         "LIGHTNESS PLANE below which it counts as truly flat. "
@@ -574,7 +554,8 @@ def main():
                         "--ensemble center at inference")
     p.add_argument("--aux-weight", type=float, default=0.0,
                    help="weight on an AUXILIARY glyph head (its own transformer "
-                        "block, dropped at inference) trained on the non-centre "
+                        "block; dropped at inference unless --glyph-ctx-aux reads "
+                        "it) trained on the non-centre "
                         "cells. Keeps neighbour prediction as a regulariser on "
                         "the tokens without letting it steer the main head")
     p.add_argument("--mask-flip", action="store_true",
@@ -586,7 +567,8 @@ def main():
                         "and is at chance on the 69%% of cells where the subject "
                         "is darker. Zero-init, exact no-op at step 0")
     p.add_argument("--mask-entropy2", type=float, default=0.0,
-                   help="penalty on the CONDITIONAL fg-vs-bg entropy -- p[:2] "
+                   help="LEGACY regulariser (--reg-share channel; off in the "
+                        "campaign): penalty on the CONDITIONAL fg-vs-bg entropy -- p[:2] "
                         "renormalised so abstain is out of it, weighted by "
                         "committed mass. The 3-way --mask-entropy can be paid "
                         "off by squeezing the near-unused abstain channel and "
@@ -653,12 +635,13 @@ def main():
                         "x 16 augs x 2 images OOM'd a 94 GB card. Chunking frees "
                         "them per group at the cost of a little recompute")
     # ---- rolling pool
-    p.add_argument("--pool", default=None, help="pool dir (default runs/<name>/pool)")
+    p.add_argument("--pool", default=None, help="pool dir (default runs/joint/<name>/pool)")
     p.add_argument("--pool-size", type=int, default=96)
     p.add_argument("--pool-add", type=int, default=16, help="entries per refresh")
     p.add_argument("--pool-refresh-every", type=int, default=150)
     p.add_argument("--pool-prefill", type=int, default=0,
-                   help="entries refined BEFORE step 0 (pool starts full)")
+                   help="entries refined when each pool's arm switches on "
+                        "(--pool-line-at / --pool-color-at)")
     p.add_argument("--pool-workers", type=int, default=8)
     p.add_argument("--pool-gpus", default="")
     p.add_argument("--pool-widths", default="40,60,80")
@@ -703,8 +686,8 @@ def main():
     p.add_argument("--muon-lr", type=float, default=0.005)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--mask-lr", type=float, default=0.0,
-                   help="separate AdamW lr for the mask branch's SPATIAL readout "
-                        "(rgb_trunk + mask_dec). 0 = off, they stay in the main "
+                   help="separate AdamW lr for the whole mask branch (rgb_trunk, "
+                        "mask_dec, mask_ctx, glyph_ctx -- see is_mask_spatial). 0 = off, they stay in the main "
                         "AdamW group at --lr. These are the weights asked to "
                         "learn a fg/bg rule from scratch and they were the "
                         "slowest-moving in the model (3-8%% vs mask_blocks' "
@@ -833,7 +816,8 @@ def main():
         # ignored -- the checkpoint's head is kept and the flags do nothing.
         print(f"  ! mask head width changed (d {_md.d} -> {args.mask_attn_dim}) "
               f"-- REBUILDING from random init, its trained weights are "
-              f"discarded. Pair with --mask-target to re-bootstrap. (Depth is "
+              f"discarded; it needs the ink mask target / mask_tgt arm to "
+              f"re-bootstrap. (Depth is "
               f"appendable without loss: use --mask-attn-extra.)", flush=True)
         model.mask_dec = None
     if args.mask_attn and not isinstance(model.mask_dec, MaskAttnDecoder):
@@ -847,7 +831,8 @@ def main():
         cfg.pop("mask_flip", None)
         print(f"  mask head -> MaskAttnDecoder (d={args.mask_attn_dim}, "
               f"{sum(x.numel() for x in model.mask_dec.parameters())/1e3:.1f}k "
-              "params, RANDOM init -- pair with --mask-target)", flush=True)
+              "params, RANDOM init -- bootstrapped by line_color / mask_tgt)",
+              flush=True)
     if args.mask_flip and getattr(model.mask_dec, "flip", None) is None:
         model.mask_dec.add_flip()
         model.mask_dec.flip.to(dev)
@@ -857,7 +842,7 @@ def main():
               "params, s=1 exactly at step 0)", flush=True)
     cfg["render_ensemble"] = args.render_ensemble
     cfg["mask_forward"] = "one"      # this trainer is single-pass; stamped so
-    # Lite/probes default to the structure the weights were actually trained on
+    # Lite defaults to the structure the weights were actually trained on
     if args.mask_attn_extra and isinstance(model.mask_dec, MaskAttnDecoder):
         had = len(model.mask_dec.px_res)
         if args.mask_attn_extra > had:
@@ -903,7 +888,8 @@ def main():
         cfg["aux_block"] = True
         print(f"  +auxiliary glyph block "
               f"({sum(x.numel() for x in model.aux_block.parameters())/1e3:.0f}k "
-              f"params, trains the NON-centre cells; dropped at inference)",
+              f"params, trains the NON-centre cells; dropped at inference unless "
+              f"--glyph-ctx-aux)",
               flush=True)
     if args.glyph_ctx_aux:
         if getattr(model, "aux_block", None) is None:
@@ -1098,15 +1084,14 @@ def main():
                         axis=1).astype(np.int32)
 
     def ce_line():
-        """The anchor -- --line-regions crops, averaged in one CE.
+        """The line_ce arm -- --line-regions crops, averaged in one CE.
 
-        At 1 this is a batch of ONE 26x44 crop out of 254 runs, and it shows:
+        At 1 this is a batch of ONE 26x44 crop out of ~250 runs, and it shows:
         `line` swings 0.42 to 2.22 between adjacent steps. That variance is not
-        harmless. This is simultaneously the noisiest term in the objective and
-        the term holding the model in place, and since lam is calibrated against
-        ||g_ce||, the noise leaks straight into the photo arm's weight -- lineart
-        crop luck modulating how hard CLIP pulls. ~26 ms a region against a
-        ~1900 ms step, so averaging a few is nearly free."""
+        harmless: this arm's gradient norm is the denominator of its own
+        normalisation (EMA'd, but still), so crop luck modulates its effective
+        weight. ~26 ms a region against a ~1900 ms step, so averaging a few is
+        nearly free."""
         idx = np.concatenate([_one_region()
                               for _ in range(max(1, args.line_regions))])
         w, lab, _, _ = cache.fetch(idx)
@@ -1154,7 +1139,8 @@ def main():
         """Everything from an RGB grid to a rendered ASCII image.
 
         Shared by the photo arm (CLIP against the photo) and the lineart
-        colour arm (MSE against a synthetic two-colour target). Kept in ONE
+        colour arm (mask CE against the true ink, optional MSE against the
+        painted target). Kept in ONE
         place because divergence between two copies of this is silent --
         the weights would simply be read through a structure they were
         never trained under, which has already happened twice here.
@@ -1231,8 +1217,9 @@ def main():
         ent2 = ((-(q.clamp_min(1e-9) * q.clamp_min(1e-9).log()).sum(1))
                 * mass).mean()
 
-        # WARM-UP TARGET: decompose's own partition, as dense per-pixel
-        # supervision on the fg-vs-bg CONDITIONAL only -- abstain is left free,
+        # DECOMPOSE PARTITION TARGET (read by the mask_tgt arm, and by the
+        # legacy --mask-target regulariser): decompose's own partition, as dense
+        # per-pixel supervision on the fg-vs-bg CONDITIONAL only -- abstain is left free,
         # so this does not re-impose the em8 chain's full per-pixel copy and
         # does not fight --mask-l1 over the abstain channel. Crucially rgb_trunk
         # never sees the ink map, so hitting this target from RGB alone requires
@@ -1443,16 +1430,14 @@ def main():
         return pair[0], pair[1]
 
     def line_color_once():
-        """Colour reconstruction on the lineart cache.
+        """The line_color arm: the mask against the lineart cache's TRUE ink.
 
-        A RECONSTRUCTION target, not a mask target: paint the cache's true ink
-        map with a sampled (fg,bg) pair, hand the model that image, and ask it
-        to reproduce it with the glyph it picks and the colours its mask fits.
-        Exact, dense, no decompose-derived supervision, and it trains the
-        PARTITION directly -- the fitted foreground has to land on the strokes.
-        Copying the glyph silhouette is not a shortcut here, because the glyph
-        never aligns exactly with the ink and the colours would be fit on the
-        wrong pixels."""
+        Paint the cache's ink map with a sampled (fg,bg) pair, hand the model
+        that image, and supervise the mask logits per pixel: ink -> fg, paper
+        -> bg (abstain free). Exact, dense, no decompose-derived supervision,
+        and it trains the PARTITION directly. The reconstruction MSE against
+        the painted image (--line-color-mse, default 0) is optional on top --
+        alone it could not bootstrap a random mask, see the comment below."""
         idx = _one_region()
         ri, top, left = int(idx[0, 0]), int(idx[0, 1]), int(idx[0, 2])
         rh0 = int(idx[:, 1].max()) - top + 1
@@ -1565,9 +1550,11 @@ def main():
         one extra autograd call per photo.
 
         Returns (g_clip, g_reg, clip, metrics, flipped). The CLIP gradient and
-        the regulariser gradient are kept SEPARATE because lam scales only the
-        former -- folding the regularisers in is what produced runB's feedback
-        loop. `metrics` is a dict so that adding a term touches no call site."""
+        the regulariser gradient are kept SEPARATE: the clip arm is normalised
+        like every other arm, the regularisers ride their own channel at a fixed
+        --reg-share of the total -- folding them into an arm is what once
+        produced a runaway feedback loop. `metrics` is a dict so that adding a
+        term touches no call site."""
         n = max(1, args.photo_batch)
         g_c = [None] * len(params)
         g_r = [None] * len(params)
@@ -1645,7 +1632,7 @@ def main():
         return g_t, float(tl), float(pl), float(il)
 
     # ------------------------------------------------------------- optimizer
-    # The mask branch's SPATIAL readout (rgb_trunk + mask_dec) is the part being
+    # The mask branch (rgb_trunk, mask_dec, mask_ctx, glyph_ctx) is the part being
     # asked to learn something new, and it was the slowest-moving part of the
     # model: split_muon_params routes anything matching "blocks." to Muon at
     # --muon-lr, and everything else -- convs included -- to AdamW at --lr. So
@@ -1743,8 +1730,6 @@ def main():
         print(f"  colorizer FROZEN: {sum(q.numel() for q in frozen)/1e3:.0f}k "
               f"params held fixed", flush=True)
     params = [q for q in model.parameters() if q.requires_grad]
-    # NB --w-line was previously accepted and never read: the trainer hardcoded
-    # the pin by simply not scaling g_line. It is honoured now.
     hist = []
     gn_ema = {}                 # EMA of each arm's own gradient norm
     ema_pol, ent2_open, w_ent2, w_tgt = None, None, 0.0, 0.0
@@ -1840,7 +1825,7 @@ def main():
                 if _p is not None and step >= _at and len(_p):
                     _p.refresh(model, chars, cfg, args.pool_add)
 
-        # ---- FIVE OBJECTIVES, each with its own gradient -----------------
+        # ---- SIX ARMS (see ARMS), each with its own gradient -------------
         # Only the arms with weight > 0 in this phase are computed at all, so a
         # phase that has not switched CLIP on pays nothing for it.
         W = phase_weights(step, phases)
@@ -1915,7 +1900,7 @@ def main():
         # g_total = sum_i  w_i * g_i / EMA(||g_i||)
         #
         # Every arm then contributes exactly w_i in gradient norm, whatever its
-        # natural scale -- and the scales differ by 30-50x (gn_line 3-6 vs
+        # natural scale -- and the scales differ by 30-100x (gn_line 3-6 vs
         # gn_clip 0.10-0.18). Nothing's weight depends on its own gradient, so
         # the feedback that broke the old --balance photo anchor cannot recur:
         # there, w_line = ratio*EMA(gn_clip/gn_line) pinned w_line*gn_line at a

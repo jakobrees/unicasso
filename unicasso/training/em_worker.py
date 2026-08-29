@@ -1,12 +1,13 @@
-"""Persistent E-step worker: run many asciify refinement jobs in ONE process.
+"""Engine worker for the refinement pools: one asciify job per process.
 
-Reads one JSON-encoded argv list per line from stdin, runs
-`unicasso.engine.asciify.main()` in-process with the ASCIIFY_PERSIST model
-cache armed (VAE / CLIP / DINO loaded once, reused across jobs), and prints
-`DONE <rc>` on its own stdout line after each job. The orchestrator
-(pool_manager.py) keeps N of these alive and feeds them jobs -- on a CUDA box, arm
-the MPS daemon first (`nvidia-cuda-mps-control -d`; NOT reboot-persistent)
-so concurrent workers share the GPU efficiently.
+Reads one JSON-encoded argv list from stdin, runs
+`unicasso.engine.asciify.main()` in-process and prints `DONE <rc>` on its own
+stdout line. The ASCIIFY_PERSIST model cache is armed so a worker COULD run
+many jobs, but pool_manager.RollingPool launches a fresh process per job (the
+cache does not survive --color-lite; see _run_fleet) and runs them in waves of
+--pool-workers -- on a CUDA box, arm the MPS daemon first
+(`nvidia-cuda-mps-control -d`; NOT reboot-persistent) so the concurrent
+workers share the GPU efficiently.
 
 Standalone use:
     echo '["photo.png","--color","--iters","200",...]' \

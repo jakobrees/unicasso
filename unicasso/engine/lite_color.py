@@ -27,8 +27,8 @@ colors are a lookup, not a term.
 Ink conventions (--color-lite-ink), i.e. what goes in the ink channel:
 
   render : the whole 5x3 window rendered from the CURRENT grid. This is what
-           lite._masks does and what the mode-2 training arm was trained on, so
-           it is in-distribution -- but a cell's colors then depend on its
+           lite._masks / lite.recolor do, and what the v2 models' colour pools
+           were coloured with during training -- but a cell's colors then depend on its
            neighbours' glyphs, so they must be re-evaluated whenever the grid
            around a cell moves.
   center : the photo's own ink everywhere, with ONLY the center cell replaced by
@@ -66,7 +66,8 @@ class LiteColorer:
         self.read = dict(color_path="topk", frac=0.25, weight="prob",
                          count="argmax", ridge=0.0, temp=1.0)
         self.read.update(read or {})
-        # k = 1 + k_scale*(k_hat - 1). DEFAULT 0 = the contrast head is not part
+        # k = 1 + k_scale*(k_hat - 1), v1 checkpoints only (the v2 models have
+        # no k head; k = 1). DEFAULT 0 = the contrast head is not part
         # of this coloring at all: it was trained against the soft mask-weighted
         # mean, it is uncorrelated with the fit separation under the selection
         # read, and it can satisfy separation constraints by itself. Kept as a

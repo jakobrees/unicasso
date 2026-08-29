@@ -169,7 +169,7 @@ class LiteResult:
     ans: str | None               # 24-bit ANSI (color model only)
     fg: np.ndarray | None         # (M, 3) cell foreground colors
     bg: np.ndarray | None
-    k: np.ndarray | None          # (gh, gw) learned contrast field
+    k: np.ndarray | None          # (gh, gw) per-cell contrast: learned for v1, all ones for v2
     render: np.ndarray | None     # (H, W, 3) float render (color) or None
     masks: np.ndarray | None = None   # (M, 3, ch, cw) fg/bg/abstain probs
     # (mask models only -- the colorize pass's per-pixel layer assignment)
@@ -450,7 +450,9 @@ class Lite:
         """Colorize pass (mode 2): ink channel = the chosen glyphs' own render,
         RGB = the photo. The masks say which photo pixels belong to the entity
         each glyph committed to -- the color fit reads those pixels directly.
-        Returns (pm (M,3,ch,cw) core-cropped softmax probs, khat (M,))."""
+        Returns (pm (M,3,ch,cw) core-cropped softmax probs, khat (M,), and the
+        margin-fit inputs fit_pm / fit_C -- fit_C is None unless the checkpoint
+        stamps mask_margin_fit)."""
         M = gh * gw
         ink_img = self.ink_flat[g].view(gh, gw, self.ch, self.cw) \
             .permute(0, 2, 1, 3).reshape(gh * self.ch, gw * self.cw)
@@ -519,8 +521,9 @@ class Lite:
         engine's --output-text format). The grid fixes the geometry -- the image
         is resized to it, the HARD-SNAPPED glyph ink goes into the ink channel,
         the photo into the RGB channels, and the mask decoder's fg/bg masks give
-        the colors. Exactly the colorize pass lite runs on its own predictions,
-        pointed at someone else's glyphs.
+        the colors -- the two-pass colorize (rendered glyph ink -> mask decoder)
+        pointed at a given grid. Pass color_path="blend", fit_ridge=1.0 to
+        colour the way render() ships for the v2 models (auto_refine does).
 
         This is the primitive a CLIP refinement loop needs: it lets the engine
         judge candidate grids in the colors the lite model would ACTUALLY give
@@ -564,9 +567,9 @@ class Lite:
                 C = fit_C if fit_C is not None else dec["cell_rgb"].to(self.device)
                 fg0, bg0 = mask_fit(fit_pm, C, ridge=fit_ridge)
         else:
-            # legacy here reads k = 1: the k head hangs off the mode-1 glyph
-            # token, which recolor never computes (the grid is given, not
-            # predicted). k is on its way out anyway -- see --k-scale.
+            # k = 1 here: the v1 k head hangs off the mode-1 glyph token, which
+            # recolor never computes (the grid is given, not predicted); the
+            # v2 models have no k head at all.
             khat = torch.ones(gh * gw, device=self.device)
             mask_g = self.ink_flat[g]
             C = dec["cell_rgb"].to(self.device)
@@ -629,8 +632,8 @@ class Lite:
         predicted, -> 0 makes 'sample' converge on 'topk'.
         fit_ridge: pull toward the plain cell mean, in pixel-mass units (the
         historic mask_fit value is 1.0; 0 removes the pull entirely).
-        k_scale: rescale the learned contrast, k = 1 + k_scale*(k_hat - 1);
-        0 disables k, 1 ships it as trained.
+        k_scale: (v1 models) rescale the learned contrast, k = 1 + k_scale*(k_hat - 1);
+        0 disables k, 1 ships it as trained. No-op for v2 (no k head).
         flat_thresh: |fg-bg| below which a cell is called empty and shipped as
         space instead of a phantom glyph.
         mask_forward: 'two' = the historic path (glyph pass, then the chosen
@@ -639,7 +642,9 @@ class Lite:
         [decompose ink, photo RGB], so no glyph silhouette is ever in the input.
         None = whatever the checkpoint was trained under.
         ensemble: how the covering windows' predictions combine per cell --
-        'mean' (kernel-weighted arithmetic mean of probs, the default),
+        None (default) = whatever the checkpoint stamps in render_ensemble
+        ('center' for the v2 colour models, 'mean' otherwise); 'mean'
+        (kernel-weighted arithmetic mean of probs),
         'gmean' (geometric mean: sharper, a window that rules a glyph out
         vetoes it), 'center' (no ensemble: own centered window only),
         'sample' (draw from the mean distribution at temperature `temp`)."""
@@ -782,12 +787,13 @@ class Lite:
 def refine(lite, image_path, result, width, iters, lead=1.0, extra=(),
            color_mode="frozen", anchor=0.0, anchor_mc=0.12,
            anchor_start=0.0, anchor_start_frac=0.0, anchor_end_frac=1.0):
-    """Polish a lite result with `iters` iterations of the full engine (swarm
+    """LEGACY (--refine-legacy; `--refine` uses auto_refine). Polish a lite
+    result with `iters` iterations of the full engine (swarm
     mode), warm-started from the grid via --init-text with a slot-0 W lead of
     `lead`. A mask-model result also carries its masks into the run; how COLOR is
     then arbitrated depends on `color_mode`:
       'frozen' (default): colors held at the lite masks' fit (--color-mask), so
-        the engine arbitrates pure shape under CLIP -- the EM E-step.
+        the engine arbitrates pure shape under CLIP.
       'free': fg/bg warm-started from the mask fit (--color-mask-mode init) then
         optimized FREELY by CLIP and shipped as-is (no closed-form at the end);
         `anchor` > 0 adds the cosine-ramped L2 pull back toward the closed-form
@@ -862,7 +868,9 @@ def refine(lite, image_path, result, width, iters, lead=1.0, extra=(),
 
 def color_refine(lite, image_path, result, width, iters, rounds=5, lead=1.0,
                  read=None, extra=(), progress=True):
-    """Color-AWARE CLIP refinement: alternate engine SHAPE refinement with
+    """LEGACY (hidden --color-refine; `--refine` uses auto_refine, which runs the
+    engine IN the model's colours via --color-lite instead of re-freezing masks
+    per round). Color-AWARE CLIP refinement: alternate engine SHAPE refinement with
     LITE-MODEL coloring, so the engine only ever judges glyphs in the colors the
     model can actually produce.
 

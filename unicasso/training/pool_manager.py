@@ -1,10 +1,12 @@
 """Rolling refinement pool: a live teacher that regenerates itself during training.
 
 The pool holds engine-refined glyph grids -- targets produced by running the
-swarm optimizer over a photo with the CURRENT model doing the coloring
-(--color-lite). Because the colors come from the model, the grids that come back
-are reachable rather than aspirational: the engine cannot buy CLIP score with a
-palette the model would never assign.
+swarm optimizer over a photo, warm-started from the CURRENT model's grid. The
+colours are either closed-form (`color='fit'`: the campaign's colour pool until
+--pool-color-switch, and the lineart pool always) or the current model's own
+(`'lite'`, --color-lite) -- in which case the grids that come back are reachable
+rather than aspirational: the engine cannot buy CLIP score with a palette the
+model would never assign.
 
 Rolling, not phased. There are no E/M rounds -- the trainer runs continuously and
 calls `refresh()` every N steps, which adds a batch of freshly refined entries
@@ -187,9 +189,9 @@ class RollingPool:
     def refresh(self, model, chars, cfg, n_add, log=print):
         """Add `n_add` freshly refined entries, then evict back to `size`.
 
-        `model` is the LIVE trainer model -- it is checkpointed to disk so the
-        engine workers can load it as --color-lite, and the same checkpoint
-        drives the lite warm-start grids. Everything the trainer was holding for
+        `model` is the LIVE trainer model -- it is checkpointed to disk for the
+        lite warm-start grids and, when `color == 'lite'`, for the engine
+        workers to load as --color-lite. Everything the trainer was holding for
         speed is released first.
         """
         self.n_refresh += 1
@@ -281,7 +283,7 @@ class RollingPool:
         """Run jobs in WAVES of `workers`, one job per worker process.
 
         The engine's ASCIIFY_PERSIST cache is meant to amortise VAE/CLIP loads
-        across many jobs in one process, which is how the EM loop used it. It does
+        across many jobs in one process (the old EM loop, no longer shipped, did). It does
         NOT survive --color-lite: job 1 runs at ~2.7 it/s, job 2 onward collapses
         to ~390 s/it on CPU with the GPU idle. A fresh process per job costs a
         model load (~20 s) and sidesteps it entirely -- the configuration that has

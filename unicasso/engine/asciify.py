@@ -1088,8 +1088,8 @@ def parse_args():
                    choices=["render", "center"],
                    help="what goes in the ink channel of the color query: 'render' = "
                         "the whole 5x3 window rendered from the current grid (what "
-                        "lite._masks does and what mode 2 was TRAINED on -- in-"
-                        "distribution, but a cell's colors then depend on its "
+                        "lite.recolor does and what the v2 models' colour pools were "
+                        "coloured with in training, but a cell's colors then depend on its "
                         "neighbours); 'center' = the photo's own ink everywhere with "
                         "only the center cell replaced by the candidate glyph, making "
                         "colors a pure function of (cell, glyph) -- permanently "
@@ -1115,7 +1115,8 @@ def parse_args():
                         "allocation (512 ~ 90MB; the whole M*K batch at w60 "
                         "would be 1.3GB, reallocated every step in forward mode)")
     p.add_argument("--color-lite-k-scale", type=float, default=0.0,
-                   help="learned per-cell contrast in the lite coloring: "
+                   help="(v1 lite models only; v2 checkpoints have no k head) "
+                        "learned per-cell contrast in the lite coloring: "
                         "k = 1 + k_scale*(k_hat - 1). DEFAULT 0 = the k head is "
                         "not used at all -- it was trained against the soft "
                         "mask-weighted mean, is uncorrelated with fit separation "
@@ -1128,15 +1129,14 @@ def parse_args():
                         "lite --dump-masks). fg/bg are computed ONCE as the "
                         "mask-weighted fit on the target cells and held constant: "
                         "colors are glyph-independent, the run arbitrates shape "
-                        "only (the EM E-step). Overrides --color-fit")
+                        "only. Overrides --color-fit")
     p.add_argument("--color-mask-mode", default="frozen",
                    choices=["frozen", "init"],
                    help="frozen = mask-fit colors held constant (pure shape "
                         "arbitration). init = colors WARM-STARTED from the "
                         "mask fit then left FREE under CLIP/recon -- the "
                         "engine optimizes colors directly (no softmax in the "
-                        "path) and the refined colors become dense mask "
-                        "supervision for the M-step")
+                        "path)")
     p.add_argument("--color-mask-ridge", type=float, default=1.0,
                    help="pixel-mass ridge toward the cell mean for low-mass "
                         "layers in the frozen-mask fit")
@@ -1899,8 +1899,9 @@ def main():
                     swarm.fit_slot_colors(1.0 - bm_flat[sg0])
                     if args.color_init:
                         # start the free leaves at the colors the LITE model actually
-                        # SHIPPED (its own recipe: cluster blend + distance-weighted fit
-                        # + k-hat), not the engine's plainer per-slot re-fit. Makes
+                        # SHIPPED (whatever that lite version's recipe is: v1 cluster
+                        # blend + distance-weighted fit + k-hat, v2 the blend-read
+                        # mask fit), not the engine's plainer per-slot re-fit. Makes
                         # --refine a true polish of the lite output instead of a
                         # re-derivation, and puts the anchor's drift metric on a
                         # meaningful zero.
@@ -1949,7 +1950,7 @@ def main():
                         swarm.fg.data.zero_(); swarm.bg.data.fill_(1.0)
                         print("color: --color-pin -> fg=black/bg=white (grayscale control arm)")
                     elif args.color_mask:
-                        # FROZEN-MASK coloring (EM E-step): fg/bg = the mask-
+                        # FROZEN-MASK coloring: fg/bg = the mask-
                         # weighted fit on the target cells, computed once and
                         # held constant across the whole run. Colors belong to
                         # the content, not the glyph: every slot in a cell

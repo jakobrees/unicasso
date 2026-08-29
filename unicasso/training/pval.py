@@ -98,7 +98,7 @@ def score(model, cfg, path):
         # --centre-only models: the main head is trained at the centre alone
         # (neighbours through the aux head), so the 15-position ensemble
         # would read 81% of its weight from untrained positions. Mirrors
-        # joint_train._render_grid and `lite --ensemble center`.
+        # joint_train._render_grid and Lite's checkpoint-resolved read.
         prob = lg[:, model.center - model.n_extra].softmax(-1)
     else:
         pr = lg.softmax(-1)

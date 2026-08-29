@@ -13,10 +13,10 @@
 #   1000-1500 line_ce .33 / pool_line .33 / clip .33             lineart pool on
 #   1500-3000 line_ce .15 / pool_line .20 / pool_color .25 / clip .40
 #   1500-2000 + mask_tgt (decompose polarity on photos) injected at .20, decaying to 0
-#             -- the sfmono recipe; in phase 0 it hardens the mask (dejavu v1)
-#   2001+     colour pool refreshes switch from closed-form to the model's colouring
-#             colour pool PREFILL is closed-form (fit); refreshes from 1750
-#             use the model's own colouring (lite). Lineart pool is always fit.
+#             (both fonts; run in phase 0 instead it hardens the mask before CLIP)
+#   1500-2000 colour pool prefill and refreshes (1750, 2000) coloured closed-form (fit)
+#   2250+     colour pool refreshes coloured by the model itself (lite;
+#             --pool-color-switch 2001). Lineart pool is always fit.
 #   2500-3000 + space/density regularisers ramp in
 #
 # Weights sum to 1.0 in every phase: under per-arm gradient normalisation the

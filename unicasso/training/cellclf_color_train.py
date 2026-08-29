@@ -359,7 +359,7 @@ def main():
                         "losses (CLIP/fit/penalties) regain traction on hard-"
                         "committed pixels, which noise at any placement cannot "
                         "give (CE losses need no help: their (p-target) "
-                        "gradient never vanishes). The orchestrator anneals "
+                        "gradient never vanishes). An external driver (none shipped) anneals "
                         "T -> 1")
     p.add_argument("--mask-logit-noise", type=float, default=0.0,
                    help="sigma of Gaussian noise on MASK LOGITS (pre-softmax) "
@@ -369,16 +369,16 @@ def main():
                         "lets the loss feel nearby assignments and pull pixels "
                         "across the boundary. Training arms only, bootstrap "
                         "arms excluded (dense targets need no exploration). "
-                        "0 = off; the orchestrator anneals it")
+                        "0 = off; an external driver (none shipped) anneals it")
     p.add_argument("--mask-color-blend", type=float, default=1.0,
                    help="refT render colors = (1-b)*closed-form + b*mask-fit "
                         "(closed-form detached). b<1 keeps CLIP judging sane "
                         "colors while the masks earn influence through their "
-                        "share; the EM orchestrator anneals b -> 1")
+                        "share; an external driver (none shipped) anneals b -> 1")
     p.add_argument("--mask-color-target", type=float, default=0.0,
                    help="MSE pulling the mask-fit colors toward the closed-"
                         "form fit (visible cells for fg). A bootstrap "
-                        "attractor -- the orchestrator anneals it to 0 so the "
+                        "attractor -- an external driver (none shipped) anneals it to 0 so the "
                         "masks may eventually beat the closed form")
     p.add_argument("--mask-bootstrap", default="plain",
                    choices=["plain", "vote"],
@@ -895,7 +895,9 @@ def main():
         return (ce + args.mask_ce_weight * mce + args.mask_color_weight * lcol
                 + args.mask_abstain_prior * pa)
 
-    # ---- refined-pool arm (E-step targets; orchestrator manages TTL) ----
+    # ---- refined-pool arm (engine-refined targets; an external driver used to
+    # manage TTL -- nothing in the package does now; joint_train's RollingPool
+    # is the live successor) ----
     ref_dir = G.repo_path(args.refined_pool) if args.refined_pool else None
     ref_cache = {}
 

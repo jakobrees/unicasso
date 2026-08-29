@@ -529,7 +529,7 @@ class MaskAttnDecoder(nn.Module):
                 if (ph or pw) else rgb
             chans.append(rgb - core.mean((2, 3), keepdim=True))
         if self.n_glyph:
-            if gsoft is None:      # caller has no glyph distribution (probes,
+            if gsoft is None:      # caller has no glyph distribution (ablations,
                 g = rgb.new_zeros(rgb.shape[0], self.n_glyph)   # ablations)
             else:
                 g = self.gemb(gsoft)
@@ -887,7 +887,8 @@ class TokenTransformer(nn.Module):
         """Per-pixel fg/bg/abstain logits for every window cell.
 
         t: post-block tokens (B, n_extra+T, dim); s1: the _embed skip
-        (B*T, 32, th/2, tw/2). Returns (B, T, 3, th, tw) patch-resolution
+        (B*T, 32, th/2, tw/2). Conv MaskDecoder path only -- MaskAttnDecoder
+        wants raw RGB and goes through mask_center. Returns (B, T, 3, th, tw) patch-resolution
         logits -- callers softmax over dim 2 and crop the cell core
         [pad_h:pad_h+CH, pad_w:pad_w+CW] before fitting colors."""
         tc = t[:, self.n_extra:]
