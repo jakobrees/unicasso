@@ -63,7 +63,7 @@ underneath. Pass `--early-stop-patience 0` to force the full length.
 | `--color-palette N` | quantize colors to an N-entry palette |
 | `--recolor-min-contrast F` | minimum fg/bg luminance gap so glyphs don't vanish in smooth regions (default 0.12) |
 | `--no-color-contrast-learn` | disable the learned per-cell contrast `k` (on by default; learned in the run's tail) |
-| `--color-lite CKPT` | colour every cell as the distilled v2 model would (`weights/lite/unicasso-lite-color*.pt`, match the font kit) instead of the closed-form fit — the run then optimizes shape inside the palette that model can produce. Not the default |
+| `--color-lite CKPT` | colour every cell as the distilled v2 model would (`weights/lite/unicasso-lite-color*.pt`, match the font kit) instead of the closed-form fit — the run then optimizes shape inside the palette that model can produce. Not the default. Disables the learned contrast `k` (colours are the model's, unmodified) |
 
 ## Perceptual metric
 

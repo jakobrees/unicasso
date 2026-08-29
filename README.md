@@ -99,7 +99,7 @@ Common flags (full list in [`docs/flags.md`](docs/flags.md)):
 | flag | does |
 |---|---|
 | `--color` | 24-bit ANSI output (fg/bg fitted per cell); needs fewer iters |
-| `--color-lite weights/lite/unicasso-lite-color.pt` | with `--color`: colour every cell the way the distilled v2 model would, instead of the closed-form fit (see [Distilled models](#distilled-models)); pick the file matching the font kit |
+| `--color-lite weights/lite/unicasso-lite-color.pt` | with `--color`: colour every cell the way the distilled v2 model would, instead of the closed-form fit (see [Distilled models](#distilled-models)); pick the file matching the font kit. The learned per-cell contrast `k` is not used in this mode — the colours are exactly the model's |
 | `--base-width N` | grid width in characters (default 60) |
 | `--ban-chars "…"` / `--ban-blocks` / `--ban-letters` | drop glyphs from the charset |
 | `--iters N` | quality/speed trade-off (300 = quick sketch, 3500 = default) |
@@ -196,9 +196,11 @@ instead of an hour.
 | <img src="examples/monochrome/gorilla_bike_lines.jpg" width="260"> | <img src="examples/monochrome/gorilla_bike.png" width="260"> | <img src="examples/lite/bike_w60_lite_v1_sfmono.png" width="260"> |
 
 A per-cell classifier has no global objective coupling cells, so it
-reproduces broad tone and layout but drops sub-cell detail and
-semantically important regions that the optimizer's CLIP loss preserves.
-Features are re-resolved at each grid size:
+reproduces broad tone and layout but drops sub-cell detail and semantically
+important regions that the optimizer's CLIP loss preserves. See above the
+careful handling of the earring glyph (single golden triangle), and the more
+selective representations in the motorbike image. Here is an example of the
+lite models on different grid sizes with the same target image:
 
 | 40 columns | 50 columns | 60 columns |
 |:---:|:---:|:---:|
@@ -241,14 +243,19 @@ minutes on an M-series Mac and need the engine's dependencies (`open_clip`). Eve
 the model is picked by `--font`, and how it is read and coloured is fixed by
 the checkpoint.
 
-**v2 color models.** The v1 color model fitted two colors per cell from a Lab
-decomposition and scaled their contrast with a learned field. v2 predicts a
-**per-pixel foreground/background mask** for every cell and fits the two colors
-through it in closed form — glyph and coloring off one forward pass — and was
-trained from scratch by `train_campaign.sh`: glyph cross-entropy against the
+**v2 color models.** The v1 color model (0.5 M parameters) fitted two colors
+per cell from a Lab decomposition and scaled their contrast with a learned
+field. v2 (1.6 M parameters per font) predicts a **per-pixel
+foreground/background mask** for every cell and fits the two colors through it
+in closed form — glyph and coloring off one forward pass — and was trained from
+scratch by `train_campaign.sh`: glyph cross-entropy against the
 optimizer's renders, a mask target from the drawings' true ink, a CLIP loss on
 photos, and rolling pools of grids refined by the optimizer in the model's own
-colors. Textures and small structure are what changed most:
+colors. A per-cell classifier has no global objective coupling cells, so it
+reproduces broad tone and layout but drops sub-cell detail and semantically
+important regions that the optimizer's CLIP loss preserves. Features are
+re-resolved at each grid size (for smaller details, zooming in and comparing
+to the target is helpful):
 
 | target | lite v1 | lite v2 |
 |:---:|:---:|:---:|

@@ -1069,7 +1069,9 @@ def parse_args():
     # models (blend read, ridge 1.0), so `--color-lite CKPT` alone colours the
     # run exactly as the lite model would; the trainer passes them explicitly.
     p.add_argument("--color-lite", default=None, metavar="CKPT",
-                   help="COLOR FROM THE LITE MODEL: fg/bg come from the distilled "
+                   help="NOTE: the learned per-cell contrast (--color-contrast-learn) "
+                        "is NOT applied in this mode; the colours are exactly the "
+                        "model's. COLOR FROM THE LITE MODEL: fg/bg come from the distilled "
                         "mask decoder instead of the closed-form MSE fit, so the run "
                         "optimizes toward colors the lite model can actually reproduce "
                         "and the refined grid is color-aware by construction. fg/bg "
@@ -1930,6 +1932,10 @@ def main():
                             k_scale=args.color_lite_k_scale,
                             chunk=args.color_lite_chunk)
                         swarm.lite_mode = args.color_lite_mode
+                        if args.color_contrast_learn:
+                            print("color: NOTE --color-lite -> the learned per-cell "
+                                  "contrast k (--color-contrast-learn) is not used; "
+                                  "fg/bg are the lite model's, unmodified")
                         swarm.lite_grid = swarm.snap(codebook)
                         if args.color_lite_mode in ("birth", "forward"):
                             swarm.fit_slot_colors(1.0 - bm_flat[sg0], glyphs=sg0)
