@@ -41,6 +41,8 @@ Ink conventions (--color-lite-ink), i.e. what goes in the ink channel:
 import numpy as np
 import torch
 
+import os
+
 from unicasso.lite import (K_BIAS, Lite, _conf_fit, _grid_windows,
                            _token_maps)
 
@@ -114,6 +116,37 @@ class LiteColorer:
         # where the center cell sits inside a window
         self.cy0 = (self.rows // 2) * self.ch + self.ph
         self.cx0 = (self.cols // 2) * self.cw + self.pw
+        # ---- per-cell caches over the EXTENDED grid (one window ring beyond
+        # each edge). A cell's patch is an absolute crop, identical in every
+        # window that covers it (see TokenTransformer.cell_embed), and the
+        # glyph being queried only ever enters through the INK pixels -- so:
+        # the RGB patches and the mask_ctx embeddings are photo-constant
+        # (cached here, forever); under ink='center' the ink context is the
+        # photo's own ink, so the full cell embeddings are constant too and
+        # only the queried centre patch is ever re-encoded; under ink='render'
+        # the cell embeddings are rebuilt per _compute call from that call's
+        # ONE counterfactual ink image, for just the cells its windows touch.
+        ry, rx = self.rows // 2, self.cols // 2
+        self.EH, self.EW = gh + 2 * ry, gw + 2 * rx
+        m = self.lite.model
+        rgb_u8 = np.asarray(im, np.uint8)
+        rgb_p = np.pad(rgb_u8, ((ry * self.ch,) * 2, (rx * self.cw,) * 2,
+                                (0, 0)), mode="edge")
+        pc = _grid_windows(rgb_p, self.EH, self.EW, self.ch, self.cw,
+                           self.ph, self.pw, 1, 1, edge=True)
+        self.cell_rgbp = torch.from_numpy(pc).to(self.dev)             .permute(0, 3, 1, 2).float().div_(255)            # (Me,3,th,tw)
+        ctxs = []
+        for i in range(0, self.cell_rgbp.shape[0], 4096):
+            c = m.cell_ctx(self.cell_rgbp[i:i + 4096])
+            if c is None:
+                ctxs = None
+                break
+            ctxs.append(c)
+        self.cell_ctxe = torch.cat(ctxs) if ctxs else None     # (Me,dim)|None
+        # window position k of centre (cy,cx) -> extended cell index
+        offs = [(t // self.cols - ry, t % self.cols - rx)
+                for t in range(self.rows * self.cols)]
+        self._eoffs = np.array([[dy, dx] for dy, dx in offs])
 
     # ------------------------------------------------------------ the query
     @torch.no_grad()
@@ -128,10 +161,114 @@ class LiteColorer:
         if self.ink_mode == "render" and grid is None:
             raise ValueError("--color-lite-ink render needs the current grid")
         self.n_query += cells.numel()
+        # ink='center' replaces the candidate's interior inside each WINDOW,
+        # which also shows in the overlapping margins of the 8 surrounding
+        # patches; the per-cell cache cannot reproduce that, so that
+        # (experimental) convention keeps the direct path.
+        if self.ink_mode != "render" or \
+                os.environ.get("UNICASSO_LITE_COLOR_DIRECT"):
+            return self._compute_direct(cells, glyphs, grid)
         return self._compute(cells, glyphs, grid)
 
     @torch.no_grad()
+    def _eids(self, centers):
+        """(n, rows*cols) extended-grid indices of each query window's cells."""
+        c = np.asarray(centers)                                   # (n,2) cy,cx
+        ry, rx = self.rows // 2, self.cols // 2
+        yy = c[:, 0][:, None] + self._eoffs[None, :, 0] + ry
+        xx = c[:, 1][:, None] + self._eoffs[None, :, 1] + rx
+        return yy * self.EW + xx
+
+    @torch.no_grad()
     def _compute(self, cells, glyphs, grid):
+        """The cached colorize pass: per-cell embeddings gathered into windows
+        -- bit-equal to `_compute_direct` (windows built and encoded whole) at
+        a fraction of the conv work. UNICASSO_LITE_COLOR_DIRECT=1 restores the
+        direct path."""
+        self.n_forward += cells.numel()
+        m = self.lite.model
+        tci = (self.rows // 2) * self.cols + self.cols // 2
+        r = self.read
+        ry, rx = self.rows // 2, self.cols // 2
+        ink_p = None
+        if self.ink_mode == "render":
+            g2 = grid.to(self.dev).long().clone()
+            g2[cells] = glyphs                    # the counterfactual grid
+            img = self.ink_flat[g2].view(self.gh, self.gw, self.ch, self.cw)                 .permute(0, 2, 1, 3)                 .reshape(self.gh * self.ch, self.gw * self.cw)
+            ink_u8 = np.clip(img.cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+            ink_p = np.pad(ink_u8, ((ry * self.ch,) * 2, (rx * self.cw,) * 2),
+                           constant_values=0)
+            del img, g2
+        cc = cells.cpu().numpy()
+        fgs, bgs = [], []
+        for i in range(0, cells.numel(), self.chunk):
+            cs = cells[i:i + self.chunk]
+            gs = glyphs[i:i + self.chunk]
+            centers = [divmod(int(c), self.gw) for c in cc[i:i + self.chunk]]
+            eids = self._eids(centers)                            # (n,T)
+            # encode ONLY the cells this chunk's windows touch, from this
+            # call's single counterfactual ink image
+            need, inv = np.unique(eids, return_inverse=True)
+            pi = _grid_windows(ink_p, self.EH, self.EW, self.ch, self.cw,
+                               self.ph, self.pw, 1, 1,
+                               centers=[divmod(int(e), self.EW)
+                                        for e in need])
+            need_t = torch.from_numpy(need).to(self.dev)
+            p4 = torch.cat([torch.from_numpy(pi).to(self.dev).float()
+                            .div_(255).unsqueeze(1),
+                            self.cell_rgbp[need_t]], dim=1)
+            emb = torch.cat([m.cell_embed(p4[j:j + 4096])
+                             for j in range(0, p4.shape[0], 4096)])
+            tok = emb[torch.from_numpy(inv).to(self.dev)]                     .view(eids.shape[0], eids.shape[1], -1)
+            del p4, emb
+            eids_t = torch.from_numpy(eids).to(self.dev)
+            ids, valid = _token_maps(self.gh, self.gw, self.rows, self.cols,
+                                     centers=centers)
+            ids_t = torch.from_numpy(ids).to(self.dev)
+            valid_t = torch.from_numpy(valid).to(self.dev)
+            ft = self.feats[ids_t] * valid_t[:, :, None].float()
+            t = tok + m.pos + m.color_proj(ft)
+            if getattr(m, "mode_emb", None) is not None:
+                t = t + m.mode_emb[2][None, None, :]
+            t = m._run_blocks(t)
+            ctxg = (self.cell_ctxe[eids_t] if self.cell_ctxe is not None
+                    else None)
+            mlog = m.mask_center(None, t, None, ctx=ctxg,
+                                 center_rgb=self.cell_rgbp[eids_t[:, tci]])
+            pm = mlog[:, :, self.ph:self.ph + self.ch,
+                      self.pw:self.pw + self.cw].softmax(1)
+            if r["color_path"] == "blend":
+                from unicasso.training.cellclf_color_train import mask_fit
+                fg, bg = mask_fit(pm, self.cell_rgb[cs],
+                                  ridge=max(r["ridge"], 1e-3))
+            else:
+                fg, bg = _conf_fit(pm, self.cell_rgb[cs], mode=r["color_path"],
+                                   frac=r["frac"], weight=r["weight"],
+                                   ridge=r["ridge"], count=r["count"],
+                                   temp=r["temp"])
+            if self.bg_fixed is not None:
+                from unicasso.engine.color import fit_fg_fixed_bg
+                bgc = self.bg_fixed.to(fg.device)
+                fg = fit_fg_fixed_bg(self.cell_rgb[cs],
+                                     pm[:, 0].reshape(pm.shape[0], -1),
+                                     bgc, ridge=max(r["ridge"], 1e-3)).clamp(0, 1)
+                bg = bgc.expand_as(fg)
+            if self.k_scale:
+                t = m.mask_tokens(t, [(getattr(m, "mask_ctx_inject", 0), ctxg)])
+                khat = 4.0 * torch.sigmoid(m.k_head(t[:, m.center])[:, 0] + K_BIAS)
+                kf = (1.0 + self.k_scale * (khat - 1.0))[:, None]
+                if self.bg_fixed is not None:
+                    fg = (bg + kf * (fg - bg)).clamp(0, 1)
+                else:
+                    mid = 0.5 * (fg + bg)
+                    fg = (mid + kf * (fg - mid)).clamp(0, 1)
+                    bg = (mid + kf * (bg - mid)).clamp(0, 1)
+            fgs.append(fg.detach())
+            bgs.append(bg.detach())
+        return torch.cat(fgs), torch.cat(bgs)
+
+    @torch.no_grad()
+    def _compute_direct(self, cells, glyphs, grid):
         """Build windows, run the colorize pass, fit. CHUNKED: the full (n,4,wh,ww)
         batch is never materialized -- at w60 that tensor alone is 1.3 GB, and in
         'forward' mode it would be reallocated every iteration."""
