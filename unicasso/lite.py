@@ -1133,6 +1133,7 @@ def auto_refine(lite, image_path, result, width, iters, extra=(), progress=True,
 
 
 def main():
+    # parsed early so the thread pool is sized before torch does any work
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("image", help="input image (photo, or line art with --line)")
@@ -1171,6 +1172,10 @@ def main():
                    choices=["mean", "gmean", "center", "sample"], help=argparse.SUPPRESS)
     p.add_argument("--temp", type=float, default=1.0, help=argparse.SUPPRESS)
     p.add_argument("--device", default=None, help="torch device (default: auto -- cuda/mps/cpu)")
+    p.add_argument("--threads", type=int, default=0, metavar="N",
+                   help="CPU threads for the forward (default: torch's own, "
+                        "usually all cores). w60 colour is ~3 s on 1 thread, "
+                        "~1 s on 8; threads only matter with --device cpu")
     p.add_argument("--color-fg", action="store_true",
                    help="FOREGROUND-ONLY colour: the background is a fixed paper colour "
                         "(--bg) that is never fitted, and the output carries foreground "
@@ -1219,6 +1224,8 @@ def main():
     p.add_argument("--seed", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--dump-masks", default=None, metavar="NPZ", help=argparse.SUPPRESS)
     args = p.parse_args()
+    if args.threads > 0:
+        torch.set_num_threads(args.threads)
     import contextlib
     with contextlib.redirect_stdout(sys.stderr):     # loader banners off stdout
         lite = Lite(args.weights or ("line" if args.line else "color"),
