@@ -91,9 +91,8 @@ GLYPHVAE_FONT=sfmono unicasso photo.jpg      # SF Mono, the terminal default on 
 ## Distilled models
 
 For an instant result without the optimizer, the `unicasso-lite` feedforward
-models render a photo in well under a second — see the README's *Distilled
-models* section. They take their own small flag set: `python -m unicasso.lite --help`
-— `--font`, `--width`, `--line`, `--out`, `--png`, glyph bans, and
-`--refine N` (polish with N optimizer iterations, colour- or shape-aware
-depending on the model). How the model is read is fixed by its checkpoint,
-not by a flag.
+models render a photo in well under a second on Apple Silicon and a few
+seconds on a plain CPU — see the README's *Distilled models* section, which
+shows the whole flag set by example. `python -m unicasso.lite --help` has the
+details; how the model is read and coloured is fixed by its checkpoint, not
+by a flag.

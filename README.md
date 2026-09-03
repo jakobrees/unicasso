@@ -296,7 +296,13 @@ cleanly and drops into anything that consumes a command's output. With no
 ```bash
 unicasso-lite photo.jpg                               # fills the terminal
 unicasso-lite photo.jpg -w 40 > logo.ans              # a fixed-width file
+unicasso-lite photo.jpg --device cpu --threads 4      # no GPU needed
 ```
+
+No GPU required: a 60-column color render takes ~3 s on a single CPU core
+(~1 s on four; ~0.3 s on Apple Silicon, which is picked automatically). The
+line model runs in ~0.3 s per core. `--threads` caps the CPU thread pool —
+useful on shared machines; by default torch uses all cores.
 
 Build notes: [`docs/lite-devlog.md`](docs/lite-devlog.md) (v2 color models,
 training recipe) and [`docs/lite-v1-devlog.md`](docs/lite-v1-devlog.md) (line
