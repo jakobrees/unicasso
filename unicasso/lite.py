@@ -1,7 +1,9 @@
 """unicasso-lite: distilled per-cell glyph models. Instant photo -> ANSI.
 
-The lite models replace the swarm optimizer with a single forward pass
-(~0.1 ms/cell on Apple Silicon; a w90 photo renders in ~0.35 s end to end):
+The lite models replace the swarm optimizer with a single forward pass:
+well under a second on Apple Silicon, a few seconds on a single CPU core
+(colour w60 ~3 s, line ~0.3 s -- every cell's trunk embedding is computed once
+and shared by all 15 windows that cover it; see cell_embed):
 
     python -m unicasso.lite photo.jpg --width 60           # 24-bit ANSI to stdout
     python -m unicasso.lite photo.jpg -w 80 --out img.ans  # write a cat-able file
@@ -182,6 +184,14 @@ class Lite:
         A checkpoint path ignores `font` -- its config names its own kit."""
         self.device = device or ("mps" if torch.backends.mps.is_available()
                                  else "cuda" if torch.cuda.is_available() else "cpu")
+        if str(self.device) == "cpu" and getattr(torch.backends, "nnpack", None):
+            # NNPACK is pathological for these shapes (tiny spatial dims, huge
+            # batch): 79% of a w60 render, ~2.1x slower end to end. Process-wide
+            # flag, but a CPU-device Lite is the terminal CLI case.
+            try:
+                torch.backends.nnpack.set_flags(False)
+            except Exception:
+                pass
         font = font or os.environ.get("GLYPHVAE_FONT", "dejavu")
         path = DEFAULT_WEIGHTS.get((kind_or_path, font), kind_or_path)
         self.ckpt_path = G.repo_path(path)
@@ -311,28 +321,48 @@ class Lite:
         ensemble = ensemble or self.render_ensemble
         M = gh * gw                                     # cells in the grid
         centers = None if stride <= 1 else _strided_centers(gh, gw, stride)
-        w = _grid_windows(ink_u8, gh, gw, self.ch, self.cw, self.ph, self.pw,
-                          self.rows, self.cols, centers=centers)
-        x = torch.from_numpy(w).to(self.device).float().div_(255).unsqueeze(1)
-        if rgb01 is not None and getattr(self.model, "in_ch", 1) == 4:
-            cwin = _grid_windows(rgb01, gh, gw, self.ch, self.cw, self.ph,
-                                 self.pw, self.rows, self.cols, edge=True,
-                                 centers=centers)
-            x = torch.cat([x, torch.from_numpy(cwin).to(self.device)
-                           .permute(0, 3, 1, 2).float()], dim=1)
         ids, valid = _token_maps(gh, gw, self.rows, self.cols, centers=centers)
         ids_t = torch.from_numpy(ids).to(self.device)
         valid_t = torch.from_numpy(valid).to(self.device)
         feats_tok = (feats[ids_t] * valid_t[:, :, None].float()
                      if feats is not None else None)
-        B = x.shape[0]
-        lo, tt = [], []
-        for i in range(0, B, 1024):
-            t = self.model._tokens(x[i:i + 1024], None,
-                                   feats_tok[i:i + 1024]
-                                   if feats_tok is not None else None, mode)
-            lo.append(self.model.head(t[:, self.model.n_extra:]))
-            tt.append(t)
+        m = self.model
+        if (centers is None and getattr(m, "n_extra", 0) == 0
+                and not getattr(m, "use_clip", False)):
+            # cached forward: per-cell embeddings once, gathered into windows
+            # (bit-equal to the direct path; see cell_embed)
+            emb, _c, _p, eids = self._cell_cache(ink_u8, gh, gw, rgb01,
+                                                 want_ctx=False)
+            lo, tt = [], []
+            for i in range(0, M, 1024):
+                t = emb[eids[i:i + 1024]] + m.pos
+                if feats_tok is not None and getattr(m, "color_proj", None) \
+                        is not None:
+                    t = t + m.color_proj(feats_tok[i:i + 1024])
+                if mode is not None and getattr(m, "mode_emb", None) is not None:
+                    t = t + m.mode_emb[mode][None, None, :]
+                t = m._run_blocks(t)
+                lo.append(m.head(t))
+                tt.append(t)
+        else:                                           # strided / clip-token
+            w = _grid_windows(ink_u8, gh, gw, self.ch, self.cw, self.ph,
+                              self.pw, self.rows, self.cols, centers=centers)
+            x = torch.from_numpy(w).to(self.device).float().div_(255) \
+                .unsqueeze(1)
+            if rgb01 is not None and getattr(m, "in_ch", 1) == 4:
+                cwin = _grid_windows(rgb01, gh, gw, self.ch, self.cw, self.ph,
+                                     self.pw, self.rows, self.cols, edge=True,
+                                     centers=centers)
+                x = torch.cat([x, torch.from_numpy(cwin).to(self.device)
+                               .permute(0, 3, 1, 2).float()], dim=1)
+            B = x.shape[0]
+            lo, tt = [], []
+            for i in range(0, B, 1024):
+                t = m._tokens(x[i:i + 1024], None,
+                              feats_tok[i:i + 1024]
+                              if feats_tok is not None else None, mode)
+                lo.append(m.head(t[:, m.n_extra:]))
+                tt.append(t)
         logits, tok = torch.cat(lo), torch.cat(tt)
         wtok = self.kernel[None, :] * valid_t.float()
         wsum = torch.zeros(M, device=self.device)
@@ -370,6 +400,42 @@ class Lite:
             pred = scores.argmax(-1)
         return pred, ct
 
+    def _cell_cache(self, ink_u8, gh, gw, rgb01, want_ctx):
+        """Per-cell embeddings for the cached forward (see cell_embed): encode
+        every cell of the EXTENDED grid (one window ring beyond each edge, with
+        the same padding the window path uses) exactly once. Returns
+        (emb (Me, dim), ctx (Me, dim)|None, patches (Me, C, th, tw), eids
+        (M, rows*cols) window-position -> extended-cell index)."""
+        ry, rx = self.rows // 2, self.cols // 2
+        EH, EW = gh + 2 * ry, gw + 2 * rx
+        ink_p = np.pad(ink_u8, ((ry * self.ch,) * 2, (rx * self.cw,) * 2),
+                       constant_values=0)
+        pi = _grid_windows(ink_p, EH, EW, self.ch, self.cw, self.ph, self.pw,
+                           1, 1)
+        p = torch.from_numpy(pi).to(self.device).float().div_(255).unsqueeze(1)
+        if rgb01 is not None and getattr(self.model, "in_ch", 1) == 4:
+            rgb_p = np.pad(rgb01, ((ry * self.ch,) * 2, (rx * self.cw,) * 2,
+                                   (0, 0)), mode="edge")
+            pc = _grid_windows(rgb_p, EH, EW, self.ch, self.cw, self.ph,
+                               self.pw, 1, 1, edge=True)
+            p = torch.cat([p, torch.from_numpy(pc).to(self.device)
+                           .permute(0, 3, 1, 2).float()], dim=1)
+        elif getattr(self.model, "in_ch", 1) == 4:
+            p = torch.cat([p, (1.0 - p).repeat(1, 3, 1, 1)], dim=1)
+        embs, ctxs = [], []
+        for i in range(0, p.shape[0], 4096):
+            embs.append(self.model.cell_embed(p[i:i + 4096]))
+            if want_ctx:
+                ctxs.append(self.model.cell_ctx(p[i:i + 4096, 1:4]))
+        emb = torch.cat(embs)
+        ctx = torch.cat(ctxs) if want_ctx and ctxs and ctxs[0] is not None             else None
+        offs = [(t // self.cols - ry, t % self.cols - rx)
+                for t in range(self.rows * self.cols)]
+        ys, xs = np.mgrid[0:gh, 0:gw]
+        eids = np.stack([(ys.ravel() + dy + ry) * EW + (xs.ravel() + dx + rx)
+                         for dy, dx in offs], 1)
+        return emb, ctx, p, torch.from_numpy(eids).to(self.device)
+
     def _txt(self, pred):
         return "\n".join("".join(self.chars[g] for g in row) for row in pred) + "\n"
 
@@ -386,26 +452,37 @@ class Lite:
         (M,th*tw,3)) -- the padded patch and its photo pixels are returned too so
         diagnostics see the same tuple `_masks` gives them."""
         M = gh * gw
-        w = _grid_windows(ink_u8, gh, gw, self.ch, self.cw, self.ph, self.pw,
-                          self.rows, self.cols)
-        x = torch.from_numpy(w).to(self.device).float().div_(255).unsqueeze(1)
-        if getattr(self.model, "in_ch", 1) == 4:
-            cwin = _grid_windows(rgb01, gh, gw, self.ch, self.cw, self.ph,
-                                 self.pw, self.rows, self.cols, edge=True)
-            x = torch.cat([x, torch.from_numpy(cwin).to(self.device)
-                           .permute(0, 3, 1, 2).float()], dim=1)
         ids, valid = _token_maps(gh, gw, self.rows, self.cols)
         ids_t = torch.from_numpy(ids).to(self.device)
         valid_t = torch.from_numpy(valid).to(self.device)
         feats_tok = feats[ids_t] * valid_t[:, :, None].float()
         tci = (self.rows // 2) * self.cols + self.cols // 2
+        # cached forward: every cell's trunk/ctx embedding computed ONCE and
+        # gathered into windows -- bit-equal to encoding each window's 15
+        # patches (a patch is an absolute crop; see cell_embed) at ~1/15th the
+        # conv work.
+        m = self.model
+        emb, cctx, pcell, eids = self._cell_cache(ink_u8, gh, gw, rgb01,
+                                                  want_ctx=True)
+        th_, tw_ = self.ch + 2 * self.ph, self.cw + 2 * self.pw
+        # window m's centre patch IS cell patch m (cell m at extended index)
+        ry, rx = self.rows // 2, self.cols // 2
+        EW = gw + 2 * rx
+        cidx = ((torch.arange(gh, device=self.device) + ry)[:, None] * EW
+                + torch.arange(gw, device=self.device)[None, :] + rx).reshape(-1)
         lo, pms = [], []
         for i in range(0, M, 1024):
-            t, s1 = self.model._tokens(x[i:i + 1024], None,
-                                       feats_tok[i:i + 1024], 1, want_skip=True)
-            n = t.shape[0]
-            lo.append(self.model.head(t[:, self.model.n_extra:]))
-            pms.append(self.model.mask_center(x[i:i + 1024], t, s1))
+            e = eids[i:i + 1024]
+            t = emb[e] + m.pos
+            t = t + m.color_proj(feats_tok[i:i + 1024])
+            if getattr(m, "mode_emb", None) is not None:
+                t = t + m.mode_emb[1][None, None, :]
+            t = m._run_blocks(t)
+            lo.append(m.head(t[:, m.n_extra:]))
+            pms.append(m.mask_center(
+                None, t, None, ctx=cctx[e] if cctx is not None else None,
+                center_rgb=pcell[cidx[i:i + 1024], 1:4]))
+        x = pcell[cidx]          # (M, C, th, tw): the centre patches, for C_full
         logits = torch.cat(lo)
         mlog = torch.cat(pms)
         # framing ensemble over the covering windows, exactly as _predict does
@@ -431,9 +508,7 @@ class Lite:
             g = scores.argmax(-1)
         pm = mlog[:, :, self.ph:self.ph + self.ch,
                   self.pw:self.pw + self.cw].softmax(1)
-        th_, tw_ = self.ch + 2 * self.ph, self.cw + 2 * self.pw
-        C_full = (x[:, 1:4, self.ch:self.ch + th_, 2 * self.cw:2 * self.cw + tw_]
-                  .permute(0, 2, 3, 1).reshape(M, th_ * tw_, 3)
+        C_full = (x[:, 1:4].permute(0, 2, 3, 1).reshape(M, th_ * tw_, 3)
                   if x.shape[1] >= 4 else None)
         return g, pm, mlog.softmax(1), C_full
 

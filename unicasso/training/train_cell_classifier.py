@@ -758,7 +758,8 @@ class TokenTransformer(nn.Module):
         c = self.center - self.n_extra
         return torch.cat([la[:, :c], lg[:, c:c + 1], la[:, c + 1:]], dim=1)
 
-    def mask_center(self, x, t, s1=None, glogits=None):
+    def mask_center(self, x, t, s1=None, glogits=None, ctx=None,
+                    center_rgb=None):
         """Mask logits for the CENTER cell of every window -- the whole mask
         branch, in one place.
 
@@ -775,7 +776,8 @@ class TokenTransformer(nn.Module):
         if need_g:
             lg = glogits if glogits is not None else self.glyph_readout(t)
             gs = lg.softmax(-1)
-        adds = [(getattr(self, "mask_ctx_inject", 0), self.mask_ctx(x))]
+        adds = [(getattr(self, "mask_ctx_inject", 0),
+                 ctx if ctx is not None else self.mask_ctx(x))]
         if getattr(self, "glyph_ctx_proj", None) is not None:
             g = self.glyph_ctx_proj(gs)
             if self.n_extra:
@@ -786,8 +788,9 @@ class TokenTransformer(nn.Module):
         if getattr(self.mask_dec, "wants_rgb", False):
             gsc = (gs[:, self.center - self.n_extra]
                    if gs is not None and self.mask_dec.n_glyph else None)
-            return self.mask_dec(tm, self.rgb_features(x, center_only=True,
-                                                       raw=True), gsc)
+            rgb = (center_rgb if center_rgb is not None else
+                   self.rgb_features(x, center_only=True, raw=True))
+            return self.mask_dec(tm, rgb, gsc)
         sk = self.rgb_features(x, center_only=True)
         if sk is None:                        # no separate encoder: use the skip
             tc = (self.rows // 2) * self.cols + self.cols // 2
@@ -814,6 +817,23 @@ class TokenTransformer(nn.Module):
         nn.init.zeros_(self.mask_ctx_proj.weight)
         nn.init.zeros_(self.mask_ctx_proj.bias)
         return self.mask_ctx_proj
+
+    def cell_embed(self, p):
+        """Per-cell trunk+proj embedding on (N, C, th, tw) patches -- the
+        position-free half of _embed. A cell's patch is an absolute crop of the
+        image (the window unfold strides by exactly one cell), so it is
+        IDENTICAL in all rows*cols windows that cover the cell: encode each
+        cell once, gather into windows, and the forward is bit-equal at 1/15th
+        of the trunk work. Lite's cached inference path builds windows as
+        cell_embed[ids] + pos (+ color_proj(feats) + mode_emb) -> _run_blocks."""
+        return self.proj(self.trunk(p).flatten(1))
+
+    def cell_ctx(self, p_rgb):
+        """Per-cell mask_ctx embedding on (N, 3, th, tw) patches -- the same
+        cacheable factoring for the mask branch's private colour encoder."""
+        if getattr(self, "mask_ctx_trunk", None) is None:
+            return None
+        return self.mask_ctx_proj(self.mask_ctx_trunk(p_rgb).flatten(1))
 
     def mask_ctx(self, x):
         """(B, 4, win_h, win_w) -> (B, rows*cols, dim), one colour summary per

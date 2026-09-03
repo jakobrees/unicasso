@@ -150,6 +150,17 @@ rather than 3000 because the `space` regulariser blanked ~30% of cells over the
 last 250 steps and cost polarity; the dejavu run did not show this.
 
 
+## Inference cost
+
+Every cell's trunk (and mask-context) embedding is computed **once** and
+gathered into the 15 windows that cover it — bit-equal to encoding each
+window's patches directly, at 1/15th of the conv work — and NNPACK is
+disabled on CPU (its conv kernels are pathological for these shapes). A w60
+colour render is ~0.3 s on Apple Silicon and ~3 s on a **single** CPU core
+(~1.3 ms/cell; the remaining cost is mostly the per-pixel mask decoder);
+the line model is ~0.3 s/core.
+
+
 ## Reproduction
 
 ```
